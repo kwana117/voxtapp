@@ -10,6 +10,7 @@ local animTimer = nil
 local dotCount = 0
 local recTask = nil
 local pulseOn = true
+local escHotkey = nil  -- forward declaration, created after cancelDictation
 
 -- ============================================
 -- Pill dimensions (webview is larger to hide window edges)
@@ -119,13 +120,18 @@ local function shellHTML()
                     <div class="dot hidden" id="dot"></div>
                     <div class="text" id="text"></div>
                     <div class="badge hidden" id="badge"
-                         onclick="window.location.href='hammerspoon://stop'"></div>
+                         onclick="window.location='hammerspoon://stop'; return false;"></div>
                 </div>
             </div>
         </body>
         </html>
     ]], PAD, PILL_W, PILL_H)
 end
+
+-- URL event handler for badge click
+hs.urlevent.bind("stop", function()
+    if isRecording then stopDictation() end
+end)
 
 local function ensurePill()
     if pillView then return end
@@ -137,21 +143,6 @@ local function ensurePill()
     pillView:allowTextEntry(false)
     pillView:transparent(true)
     pillView:alpha(1.0)
-    -- Intercept navigation to hammerspoon:// for badge clicks
-    pillView:navigationCallback(function(action, wv, navID, url)
-        if action == "navigationResponse" then return end
-        if url and url:find("hammerspoon://stop") then
-            if isRecording then stopDictation() end
-            return true  -- block navigation
-        end
-    end)
-    pillView:policyCallback(function(action, wv, details)
-        if details and details.url and details.url:find("hammerspoon://stop") then
-            if isRecording then stopDictation() end
-            return false  -- block navigation
-        end
-        return true
-    end)
     pillView:html(shellHTML())
     pillView:show()
 end
@@ -240,6 +231,7 @@ local function startDictation()
     dotCount = 0
     pulseOn = true
 
+    escHotkey:enable()
     ensurePill()
     hs.timer.doAfter(0.1, function()
         showRecording()
@@ -259,6 +251,7 @@ end
 function stopDictation()
     if not isRecording then return end
     isRecording = false
+    escHotkey:disable()
 
     if animTimer then animTimer:stop(); animTimer = nil end
     if recTask and recTask:isRunning() then recTask:terminate() end
@@ -281,6 +274,7 @@ end
 local function cancelDictation()
     if not isRecording then return end
     isRecording = false
+    escHotkey:disable()
     if animTimer then animTimer:stop(); animTimer = nil end
     if recTask and recTask:isRunning() then recTask:terminate() end
     recTask = nil
@@ -299,12 +293,9 @@ hs.hotkey.bind({"cmd", "alt"}, "L", function()
     end
 end)
 
-hs.hotkey.bind({}, "escape", function()
-    if isRecording then
-        cancelDictation()
-    else
-        return false
-    end
+-- Escape hotkey — enabled/disabled dynamically with recording state
+escHotkey = hs.hotkey.new({}, "escape", function()
+    cancelDictation()
 end)
 
 require("hs.ipc")
