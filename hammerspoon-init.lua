@@ -29,60 +29,24 @@ local function getPillFrame()
 end
 
 -- ============================================
--- HTML pill
+-- HTML shell (created once, updated via JS)
 -- ============================================
-local function pillHTML(opts)
-    -- opts: text, color, bgColor, dotColor, badge, icon
-    local dot = ""
-    if opts.dotColor then
-        local opacity = opts.dotDim and "0.4" or "1"
-        dot = string.format([[
-            <div style="
-                width:10px; height:10px; border-radius:50%%;
-                background:%s; opacity:%s;
-                box-shadow: 0 0 8px 2px %s;
-                flex-shrink:0;
-            "></div>
-        ]], opts.dotColor, opacity, opts.dotColor)
-    end
-
-    local icon = ""
-    if opts.icon then
-        icon = string.format([[<span style="margin-right:4px;">%s</span>]], opts.icon)
-    end
-
-    local badge = ""
-    if opts.badge then
-        badge = string.format([[
-            <div style="
-                background: rgba(255,255,255,0.1);
-                border-radius: 6px;
-                padding: 3px 10px;
-                font-size: 11px;
-                color: rgba(255,255,255,0.45);
-                white-space: nowrap;
-                flex-shrink: 0;
-                letter-spacing: 0.3px;
-            ">%s</div>
-        ]], opts.badge)
-    end
-
-    return string.format([[
+local function shellHTML()
+    return [[
         <html>
         <head><style>
             * { margin:0; padding:0; box-sizing:border-box; }
             html, body {
-                background: transparent;
+                background: transparent !important;
                 overflow: hidden;
-                height: 100%%;
+                height: 100%;
             }
             .pill {
                 display: flex;
                 align-items: center;
                 gap: 10px;
-                height: 100%%;
+                height: 100%;
                 padding: 0 16px;
-                background: %s;
                 border-radius: 14px;
                 border: 0.5px solid rgba(255,255,255,0.12);
                 box-shadow:
@@ -93,9 +57,19 @@ local function pillHTML(opts)
                 -webkit-backdrop-filter: blur(40px) saturate(1.5);
                 font-family: -apple-system, BlinkMacSystemFont, sans-serif;
                 font-size: 13px;
-                color: %s;
                 -webkit-font-smoothing: antialiased;
+                background: rgba(28,28,32,0.82);
+                color: rgba(255,255,255,0.9);
+                transition: background 0.3s ease, color 0.3s ease;
             }
+            .dot {
+                width: 10px; height: 10px; border-radius: 50%;
+                background: #ff4444;
+                box-shadow: 0 0 8px 2px rgba(255,68,68,0.4);
+                flex-shrink: 0;
+                transition: opacity 0.4s ease;
+            }
+            .dot.hidden { display: none; }
             .text {
                 flex: 1;
                 overflow: hidden;
@@ -104,22 +78,31 @@ local function pillHTML(opts)
                 font-weight: 500;
                 letter-spacing: -0.1px;
             }
+            .badge {
+                background: rgba(255,255,255,0.1);
+                border-radius: 6px;
+                padding: 3px 10px;
+                font-size: 11px;
+                color: rgba(255,255,255,0.45);
+                white-space: nowrap;
+                flex-shrink: 0;
+                letter-spacing: 0.3px;
+            }
+            .badge.hidden { display: none; }
         </style></head>
         <body>
-            <div class="pill">
-                %s
-                <div class="text">%s%s</div>
-                %s
+            <div class="pill" id="pill">
+                <div class="dot hidden" id="dot"></div>
+                <div class="text" id="text"></div>
+                <div class="badge hidden" id="badge"></div>
             </div>
         </body>
         </html>
-    ]], opts.bgColor or "rgba(28,28,32,0.85)", opts.color or "rgba(255,255,255,0.9)",
-        dot, icon, opts.text, badge)
+    ]]
 end
 
-local function showPill(opts)
-    if pillView then pillView:delete(); pillView = nil end
-
+local function ensurePill()
+    if pillView then return end
     local frame = getPillFrame()
     pillView = hs.webview.new(frame, { developerExtrasEnabled = false })
     pillView:windowStyle({"borderless", "nonactivating"})
@@ -128,8 +111,41 @@ local function showPill(opts)
     pillView:allowTextEntry(false)
     pillView:transparent(true)
     pillView:alpha(1.0)
-    pillView:html(pillHTML(opts))
+    pillView:html(shellHTML())
     pillView:show()
+end
+
+local function updatePill(opts)
+    ensurePill()
+    -- Use textContent for safe text updates (no XSS risk)
+    local js = string.format([[
+        (function() {
+            var pill = document.getElementById('pill');
+            var dot = document.getElementById('dot');
+            var text = document.getElementById('text');
+            var badge = document.getElementById('badge');
+
+            pill.style.background = '%s';
+            pill.style.color = '%s';
+
+            dot.className = 'dot%s';
+            dot.style.opacity = '%s';
+
+            text.textContent = '%s';
+
+            badge.className = 'badge%s';
+            badge.textContent = '%s';
+        })();
+    ]],
+        opts.bg or "rgba(28,28,32,0.82)",
+        opts.color or "rgba(255,255,255,0.9)",
+        opts.showDot and "" or " hidden",
+        opts.dotOpacity or "1",
+        opts.text or "",
+        opts.badge and "" or " hidden",
+        opts.badge or ""
+    )
+    pillView:evaluateJavaScript(js)
 end
 
 -- ============================================
@@ -138,32 +154,33 @@ end
 local function showRecording()
     dotCount = (dotCount % 3) + 1
     pulseOn = not pulseOn
-    showPill({
+    updatePill({
         text = "Recording" .. string.rep(".", dotCount),
-        bgColor = "rgba(28, 28, 32, 0.82)",
+        bg = "rgba(28, 28, 32, 0.82)",
         color = "rgba(255,255,255,0.92)",
-        dotColor = "#ff4444",
-        dotDim = not pulseOn,
+        showDot = true,
+        dotOpacity = pulseOn and "1" or "0.4",
         badge = "Stop ⌥⌘L",
     })
 end
 
 local function showTranscribing()
-    showPill({
+    updatePill({
         text = "Transcribing...",
-        bgColor = "rgba(24, 26, 40, 0.82)",
+        bg = "rgba(24, 26, 40, 0.82)",
         color = "rgba(140, 170, 255, 0.92)",
+        showDot = false,
     })
 end
 
 local function showResult(text)
     if not text or text == "" then text = "(no text detected)" end
     if #text > 42 then text = text:sub(1, 39) .. "..." end
-    showPill({
+    updatePill({
         text = text,
-        bgColor = "rgba(22, 34, 26, 0.82)",
+        bg = "rgba(22, 34, 26, 0.82)",
         color = "rgba(120, 240, 160, 0.92)",
-        icon = "✓",
+        showDot = false,
     })
     hs.timer.doAfter(3.5, function()
         if pillView then pillView:delete(); pillView = nil end
@@ -182,9 +199,13 @@ local function startDictation()
     isRecording = true
     dotCount = 0
     pulseOn = true
-    showRecording()
 
-    animTimer = hs.timer.doEvery(0.45, function()
+    ensurePill()
+    hs.timer.doAfter(0.1, function()
+        showRecording()
+    end)
+
+    animTimer = hs.timer.doEvery(0.6, function()
         if isRecording then showRecording() end
     end)
 
@@ -246,4 +267,4 @@ hs.hotkey.bind({}, "escape", function()
 end)
 
 require("hs.ipc")
-hs.printf("Whisper Dictation loaded — ⌥⌘L toggle (webview pill)")
+hs.printf("Whisper Dictation loaded — ⌥⌘L toggle (webview pill v2)")
