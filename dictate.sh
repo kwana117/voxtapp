@@ -77,9 +77,8 @@ transcribe() {
         if [ -n "$TEXT" ] && [ "$TEXT" != "[BLANK_AUDIO]" ]; then
             # Guardar resultado para Hammerspoon ler
             printf "%s" "$TEXT" > /tmp/dictation.result
-            # Copiar para clipboard e colar
+            # Copiar para clipboard (paste é feito pelo Hammerspoon após focar janela original)
             printf "%s" "$TEXT" | pbcopy
-            osascript -e 'tell application "System Events" to keystroke "v" using command down'
             echo "done" > /tmp/dictation.state
         else
             echo "" > /tmp/dictation.result

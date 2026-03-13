@@ -253,6 +253,10 @@ function stopDictation()
     isRecording = false
     escHotkey:disable()
 
+    -- Guardar janela/app ativa ANTES de o utilizador mudar de janela
+    local targetWindow = hs.window.focusedWindow()
+    local targetApp = hs.application.frontmostApplication()
+
     if animTimer then animTimer:stop(); animTimer = nil end
     if recTask and recTask:isRunning() then recTask:terminate() end
     recTask = nil
@@ -267,6 +271,19 @@ function stopDictation()
             rf:close()
             os.remove("/tmp/dictation.result")
         end
+
+        if result ~= "" then
+            -- Focar janela original e colar
+            if targetWindow then
+                targetWindow:focus()
+            elseif targetApp then
+                targetApp:activate()
+            end
+            hs.timer.doAfter(0.15, function()
+                hs.eventtap.keyStroke({"cmd"}, "v")
+            end)
+        end
+
         showResult(result ~= "" and result or nil)
     end, { dictateScript, "stop-transcribe-only" }):start()
 end
