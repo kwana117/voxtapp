@@ -4,13 +4,21 @@
 -- ============================================
 
 local dictateScript = os.getenv("HOME") .. "/scripts/dictate.sh"
+
+-- ============================================
+-- Configuração
+-- ============================================
+local AUTO_ENTER = true   -- true = pressiona Enter automaticamente após colar
 local isRecording = false
 local pillView = nil
 local animTimer = nil
 local dotCount = 0
 local recTask = nil
 local pulseOn = true
-local escHotkey = nil  -- forward declaration, created after cancelDictation
+local escHotkey = nil    -- forward declaration, created after cancelDictation
+local enterHotkey = nil  -- forward declaration, created after stopDictation
+local targetWindow = nil
+local targetApp = nil
 
 -- ============================================
 -- Pill dimensions (webview is larger to hide window edges)
@@ -191,7 +199,7 @@ local function showRecording()
         color = "rgba(255,255,255,0.92)",
         showDot = true,
         dotOpacity = pulseOn and "1" or "0.4",
-        badge = "Stop ⌥⌘L",
+        badge = "Stop ↵",
     })
 end
 
@@ -231,7 +239,12 @@ local function startDictation()
     dotCount = 0
     pulseOn = true
 
+    -- Guardar janela ativa AGORA (antes de qualquer mudança de foco)
+    targetWindow = hs.window.focusedWindow()
+    targetApp = hs.application.frontmostApplication()
+
     escHotkey:enable()
+    enterHotkey:enable()
     ensurePill()
     hs.timer.doAfter(0.1, function()
         showRecording()
@@ -252,10 +265,7 @@ function stopDictation()
     if not isRecording then return end
     isRecording = false
     escHotkey:disable()
-
-    -- Guardar janela/app ativa ANTES de o utilizador mudar de janela
-    local targetWindow = hs.window.focusedWindow()
-    local targetApp = hs.application.frontmostApplication()
+    enterHotkey:disable()
 
     if animTimer then animTimer:stop(); animTimer = nil end
     if recTask and recTask:isRunning() then recTask:terminate() end
@@ -277,10 +287,17 @@ function stopDictation()
             if targetWindow then
                 targetWindow:focus()
             elseif targetApp then
-                targetApp:activate()
+                targetApp:activate(true)
             end
-            hs.timer.doAfter(0.15, function()
+            hs.timer.doAfter(0.3, function()
                 hs.eventtap.keyStroke({"cmd"}, "v")
+                if AUTO_ENTER then
+                    hs.timer.doAfter(0.05, function()
+                        hs.eventtap.keyStroke({}, "return")
+                    end)
+                end
+                targetWindow = nil
+                targetApp = nil
             end)
         end
 
@@ -292,6 +309,7 @@ local function cancelDictation()
     if not isRecording then return end
     isRecording = false
     escHotkey:disable()
+    enterHotkey:disable()
     if animTimer then animTimer:stop(); animTimer = nil end
     if recTask and recTask:isRunning() then recTask:terminate() end
     recTask = nil
@@ -313,6 +331,11 @@ end)
 -- Escape hotkey — enabled/disabled dynamically with recording state
 escHotkey = hs.hotkey.new({}, "escape", function()
     cancelDictation()
+end)
+
+-- Enter hotkey — para a gravação (tem prioridade sobre qualquer app)
+enterHotkey = hs.hotkey.new({}, "return", function()
+    if isRecording then stopDictation() end
 end)
 
 require("hs.ipc")
