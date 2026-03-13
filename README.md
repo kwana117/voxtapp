@@ -23,7 +23,7 @@ Press a shortcut, speak, press again — your speech is transcribed and pasted w
 ## Install
 
 ```bash
-git clone https://github.com/joaogoncalodias/voxtapp.git
+git clone https://github.com/kwana117/voxtapp.git
 cd voxtapp
 chmod +x install.sh
 ./install.sh
