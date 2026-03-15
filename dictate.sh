@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Garantir que Homebrew está no PATH (Hammerspoon usa PATH mínimo)
+export PATH="/opt/homebrew/bin:$PATH"
+# Garantir UTF-8 (Hammerspoon não herda locale do shell)
+export LANG="en_US.UTF-8"
+export LC_ALL="en_US.UTF-8"
+
 # === Configuração ===
 WHISPER_DIR="$HOME/whisper.cpp"
 MODEL="$WHISPER_DIR/models/ggml-large-v3.bin"
