@@ -17,6 +17,7 @@ local recTask = nil
 local pulseOn = true
 local escHotkey = nil    -- forward declaration, created after cancelDictation
 local enterHotkey = nil  -- forward declaration, created after stopDictation
+local shiftHotkey = nil  -- forward declaration: stop without auto-enter
 local targetWindow = nil
 local targetApp = nil
 
@@ -199,7 +200,7 @@ local function showRecording()
         color = "rgba(255,255,255,0.92)",
         showDot = true,
         dotOpacity = pulseOn and "1" or "0.4",
-        badge = "Stop ↵",
+        badge = "⇧ Paste  ↵ Send",
     })
 end
 
@@ -245,6 +246,7 @@ local function startDictation()
 
     escHotkey:enable()
     enterHotkey:enable()
+    shiftHotkey:start()
     ensurePill()
     hs.timer.doAfter(0.1, function()
         showRecording()
@@ -261,11 +263,13 @@ local function startDictation()
 end
 
 -- Forward-declared above ensurePill so policyCallback can reference it
-function stopDictation()
+function stopDictation(autoEnter)
     if not isRecording then return end
+    if autoEnter == nil then autoEnter = AUTO_ENTER end
     isRecording = false
     escHotkey:disable()
     enterHotkey:disable()
+    shiftHotkey:stop()
 
     if animTimer then animTimer:stop(); animTimer = nil end
     if recTask and recTask:isRunning() then recTask:terminate() end
@@ -291,7 +295,7 @@ function stopDictation()
             end
             hs.timer.doAfter(0.3, function()
                 hs.eventtap.keyStroke({"cmd"}, "v")
-                if AUTO_ENTER then
+                if autoEnter then
                     hs.timer.doAfter(0.05, function()
                         hs.eventtap.keyStroke({}, "return")
                     end)
@@ -310,6 +314,7 @@ local function cancelDictation()
     isRecording = false
     escHotkey:disable()
     enterHotkey:disable()
+    shiftHotkey:stop()
     if animTimer then animTimer:stop(); animTimer = nil end
     if recTask and recTask:isRunning() then recTask:terminate() end
     recTask = nil
@@ -333,9 +338,22 @@ escHotkey = hs.hotkey.new({}, "escape", function()
     cancelDictation()
 end)
 
--- Enter hotkey — para a gravação (tem prioridade sobre qualquer app)
+-- Enter hotkey — para a gravação e faz auto-enter (tem prioridade sobre qualquer app)
 enterHotkey = hs.hotkey.new({}, "return", function()
-    if isRecording then stopDictation() end
+    if isRecording then stopDictation(true) end
+end)
+
+-- Shift key tap — para a gravação e cola o texto SEM fazer Enter
+-- Uses eventtap to detect shift key press (since shift alone isn't a regular hotkey)
+shiftHotkey = hs.eventtap.new({hs.eventtap.event.types.flagsChanged}, function(event)
+    if not isRecording then return false end
+    local flags = event:getFlags()
+    -- Detect shift key press (not release), and no other modifiers
+    if flags.shift and not flags.cmd and not flags.alt and not flags.ctrl then
+        stopDictation(false)
+        return true  -- consume the event
+    end
+    return false
 end)
 
 require("hs.ipc")
