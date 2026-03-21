@@ -8,18 +8,38 @@ local dictateScript = os.getenv("HOME") .. "/scripts/dictate.sh"
 -- ============================================
 -- Configuração
 -- ============================================
-local AUTO_ENTER = true   -- true = pressiona Enter automaticamente após colar
+local AUTO_ENTER = true
 local isRecording = false
 local pillView = nil
-local animTimer = nil
-local dotCount = 0
 local recTask = nil
-local pulseOn = true
-local escHotkey = nil    -- forward declaration, created after cancelDictation
-local enterHotkey = nil  -- forward declaration, created after stopDictation
-local shiftHotkey = nil  -- forward declaration: stop without auto-enter
+local escHotkey = nil
+local enterHotkey = nil
+local shiftHotkey = nil
 local targetWindow = nil
 local targetApp = nil
+local loadingSound = nil
+
+-- ============================================
+-- Sound feedback
+-- ============================================
+local function playSound(name, vol)
+    local s = hs.sound.getByName(name)
+    if s then s:volume(vol or 0.5); s:play() end
+end
+
+local function stopLoadingSound()
+    if loadingSound then loadingSound:stop(); loadingSound = nil end
+end
+
+local function startLoadingSound()
+    stopLoadingSound()
+    loadingSound = hs.sound.getByName("Purr")
+    if loadingSound then
+        loadingSound:volume(0.18)
+        loadingSound:looping(true)
+        loadingSound:play()
+    end
+end
 
 -- ============================================
 -- Pill dimensions (webview is larger to hide window edges)
@@ -63,6 +83,10 @@ local function shellHTML()
                 justify-content: center;
                 padding: %dpx;
             }
+            @keyframes pillIn {
+                from { opacity:0; transform: translateY(-6px) scale(0.97); }
+                to   { opacity:1; transform: translateY(0)    scale(1);    }
+            }
             .pill {
                 display: flex;
                 align-items: center;
@@ -83,15 +107,47 @@ local function shellHTML()
                 background: rgba(28,28,32,0.82);
                 color: rgba(255,255,255,0.9);
                 transition: background 0.3s ease, color 0.3s ease;
+                animation: pillIn 0.22s ease-out;
             }
-            .dot {
-                width: 10px; height: 10px; border-radius: 50%%;
-                background: #ff4444;
-                box-shadow: 0 0 8px 2px rgba(255,68,68,0.4);
+            /* === Wave bars (recording state) === */
+            .wave {
+                display: flex;
+                align-items: center;
+                gap: 2.5px;
                 flex-shrink: 0;
-                transition: opacity 0.4s ease;
+                height: 20px;
             }
-            .dot.hidden { display: none; }
+            .wave.hidden { display: none; }
+            @keyframes waveBar {
+                from { height: 3px;  opacity: 0.5; }
+                to   { height: 16px; opacity: 1.0; }
+            }
+            .wave b {
+                display: block;
+                width: 3px;
+                border-radius: 2px;
+                background: #ff5252;
+                box-shadow: 0 0 5px rgba(255,82,82,0.55);
+                animation: waveBar 0.65s ease-in-out infinite alternate;
+            }
+            .wave b:nth-child(1) { animation-delay: 0.00s; }
+            .wave b:nth-child(2) { animation-delay: 0.11s; }
+            .wave b:nth-child(3) { animation-delay: 0.22s; }
+            .wave b:nth-child(4) { animation-delay: 0.11s; }
+            .wave b:nth-child(5) { animation-delay: 0.00s; }
+            /* === Spinner (transcribing state) === */
+            .spinner {
+                width: 14px;
+                height: 14px;
+                border: 2px solid rgba(140,170,255,0.25);
+                border-top-color: rgba(140,170,255,0.9);
+                border-radius: 50%%;
+                flex-shrink: 0;
+                animation: spin 0.75s linear infinite;
+            }
+            .spinner.hidden { display: none; }
+            @keyframes spin { to { transform: rotate(360deg); } }
+            /* === Text === */
             .text {
                 flex: 1;
                 overflow: hidden;
@@ -100,6 +156,12 @@ local function shellHTML()
                 font-weight: 500;
                 letter-spacing: -0.1px;
             }
+            @keyframes textIn {
+                from { opacity: 0; transform: translateY(2px); }
+                to   { opacity: 1; transform: translateY(0);   }
+            }
+            .text.anim { animation: textIn 0.22s ease-out; }
+            /* === Badge === */
             .badge {
                 background: rgba(255,255,255,0.1);
                 border-radius: 6px;
@@ -114,19 +176,15 @@ local function shellHTML()
                 -webkit-user-select: none;
                 transition: background 0.15s ease;
             }
-            .badge:hover {
-                background: rgba(255,255,255,0.18);
-                color: rgba(255,255,255,0.7);
-            }
-            .badge:active {
-                background: rgba(255,255,255,0.25);
-            }
+            .badge:hover  { background: rgba(255,255,255,0.18); color: rgba(255,255,255,0.7); }
+            .badge:active { background: rgba(255,255,255,0.25); }
             .badge.hidden { display: none; }
         </style></head>
         <body>
             <div class="wrapper">
                 <div class="pill" id="pill">
-                    <div class="dot hidden" id="dot"></div>
+                    <div class="wave hidden" id="wave"><b></b><b></b><b></b><b></b><b></b></div>
+                    <div class="spinner hidden" id="spinner"></div>
                     <div class="text" id="text"></div>
                     <div class="badge hidden" id="badge"
                          onclick="window.location='hammerspoon://stop'; return false;"></div>
@@ -158,32 +216,38 @@ end
 
 local function updatePill(opts)
     ensurePill()
+    local safeText  = (opts.text  or ""):gsub("\\", "\\\\"):gsub("'", "\\'")
+    local safeBadge = (opts.badge or ""):gsub("\\", "\\\\"):gsub("'", "\\'")
     local js = string.format([[
         (function() {
-            var pill = document.getElementById('pill');
-            var dot = document.getElementById('dot');
-            var text = document.getElementById('text');
-            var badge = document.getElementById('badge');
+            var pill    = document.getElementById('pill');
+            var wave    = document.getElementById('wave');
+            var spinner = document.getElementById('spinner');
+            var text    = document.getElementById('text');
+            var badge   = document.getElementById('badge');
 
             pill.style.background = '%s';
-            pill.style.color = '%s';
+            pill.style.color      = '%s';
 
-            dot.className = 'dot%s';
-            dot.style.opacity = '%s';
+            wave.className    = %s ? 'wave'    : 'wave hidden';
+            spinner.className = %s ? 'spinner' : 'spinner hidden';
 
+            text.className = 'text';
+            void text.offsetWidth;
+            text.className = 'text anim';
             text.textContent = '%s';
 
-            badge.className = 'badge%s';
+            badge.className   = %s ? 'badge' : 'badge hidden';
             badge.textContent = '%s';
         })();
     ]],
-        opts.bg or "rgba(28,28,32,0.82)",
+        opts.bg    or "rgba(28,28,32,0.82)",
         opts.color or "rgba(255,255,255,0.9)",
-        opts.showDot and "" or " hidden",
-        opts.dotOpacity or "1",
-        opts.text or "",
-        opts.badge and "" or " hidden",
-        opts.badge or ""
+        opts.showWave    and "true" or "false",
+        opts.showSpinner and "true" or "false",
+        safeText,
+        opts.badge and "true" or "false",
+        safeBadge
     )
     pillView:evaluateJavaScript(js)
 end
@@ -192,35 +256,33 @@ end
 -- States
 -- ============================================
 local function showRecording()
-    dotCount = (dotCount % 3) + 1
-    pulseOn = not pulseOn
     updatePill({
-        text = "Recording" .. string.rep(".", dotCount),
-        bg = "rgba(28, 28, 32, 0.82)",
-        color = "rgba(255,255,255,0.92)",
-        showDot = true,
-        dotOpacity = pulseOn and "1" or "0.4",
-        badge = "⇧ Paste  ↵ Send",
+        text     = "Recording\xe2\x80\xa6",
+        bg       = "rgba(28, 28, 32, 0.82)",
+        color    = "rgba(255,255,255,0.92)",
+        showWave = true,
+        badge    = "\xe2\x87\xa7 Paste  \xe2\x86\xb5 Send",
     })
 end
 
 local function showTranscribing()
     updatePill({
-        text = "Transcribing...",
-        bg = "rgba(24, 26, 40, 0.82)",
-        color = "rgba(140, 170, 255, 0.92)",
-        showDot = false,
+        text        = "Transcribing\xe2\x80\xa6",
+        bg          = "rgba(24, 26, 40, 0.82)",
+        color       = "rgba(140, 170, 255, 0.92)",
+        showSpinner = true,
     })
 end
 
 local function showResult(text)
+    stopLoadingSound()
+    playSound("Glass", 0.5)
     if not text or text == "" then text = "(no text detected)" end
     if #text > 42 then text = text:sub(1, 39) .. "..." end
     updatePill({
-        text = "✓ " .. text,
-        bg = "rgba(22, 34, 26, 0.82)",
+        text  = "\xe2\x9c\x93 " .. text,
+        bg    = "rgba(22, 34, 26, 0.82)",
         color = "rgba(120, 240, 160, 0.92)",
-        showDot = false,
     })
     hs.timer.doAfter(3.5, function()
         if pillView then pillView:delete(); pillView = nil end
@@ -228,6 +290,7 @@ local function showResult(text)
 end
 
 local function hidePill()
+    stopLoadingSound()
     if pillView then pillView:delete(); pillView = nil end
 end
 
@@ -237,24 +300,18 @@ end
 local function startDictation()
     if isRecording then return end
     isRecording = true
-    dotCount = 0
-    pulseOn = true
 
     -- Guardar janela ativa AGORA (antes de qualquer mudança de foco)
     targetWindow = hs.window.focusedWindow()
-    targetApp = hs.application.frontmostApplication()
+    targetApp    = hs.application.frontmostApplication()
 
     escHotkey:enable()
     enterHotkey:enable()
     shiftHotkey:start()
-    ensurePill()
-    hs.timer.doAfter(0.1, function()
-        showRecording()
-    end)
 
-    animTimer = hs.timer.doEvery(0.6, function()
-        if isRecording then showRecording() end
-    end)
+    playSound("Tink", 0.45)
+    ensurePill()
+    hs.timer.doAfter(0.1, showRecording)
 
     recTask = hs.task.new("/opt/homebrew/bin/rec", function() end, {
         "-r", "16000", "-c", "1", "-b", "16", "/tmp/dictation.wav",
@@ -271,11 +328,12 @@ function stopDictation(autoEnter)
     enterHotkey:disable()
     shiftHotkey:stop()
 
-    if animTimer then animTimer:stop(); animTimer = nil end
     if recTask and recTask:isRunning() then recTask:terminate() end
     recTask = nil
 
+    playSound("Pop", 0.35)
     showTranscribing()
+    startLoadingSound()
 
     hs.task.new("/bin/bash", function(code, out, err)
         local result = ""
@@ -301,7 +359,7 @@ function stopDictation(autoEnter)
                     end)
                 end
                 targetWindow = nil
-                targetApp = nil
+                targetApp    = nil
             end)
         end
 
@@ -315,7 +373,6 @@ local function cancelDictation()
     escHotkey:disable()
     enterHotkey:disable()
     shiftHotkey:stop()
-    if animTimer then animTimer:stop(); animTimer = nil end
     if recTask and recTask:isRunning() then recTask:terminate() end
     recTask = nil
     hidePill()
@@ -357,4 +414,4 @@ shiftHotkey = hs.eventtap.new({hs.eventtap.event.types.flagsChanged}, function(e
 end)
 
 require("hs.ipc")
-hs.printf("Whisper Dictation loaded — ⌥⌘L toggle (webview pill v3)")
+hs.printf("Whisper Dictation loaded — \xe2\x8c\xa5\xe2\x8c\x98L toggle (webview pill v4)")
