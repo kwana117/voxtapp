@@ -20,10 +20,11 @@ local targetApp = nil
 local dismissTimer = nil
 local beatTimer = nil
 local beatIndex = 0
-local BEAT_INTERVAL = 0.45  -- ~133 BPM
-local BEAT_PATTERN  = {true, true, false, false, true, false, false, false}
+local BEAT_INTERVAL = 0.4   -- lub-dub: 2 beats close, 2 beats silence (~38 BPM cycle)
+local BEAT_PATTERN  = {true, true, false, false}
 local waveTimer = nil
 local waveValues = {8, 12, 16, 12, 8}
+local waveEnergy = 0.3
 
 -- ============================================
 -- Sound feedback
@@ -67,11 +68,17 @@ end
 
 local function startWaveAnimation()
     stopWaveAnimation()
-    waveValues = {8, 12, 16, 12, 8}
+    waveValues = {4, 6, 8, 6, 4}
+    waveEnergy = 0.3
     waveTimer = hs.timer.doEvery(0.08, function()
         if not pillView or not isRecording then return end
+        -- energy drifts slowly (simulates speech vs silence)
+        waveEnergy = math.max(0.05, math.min(1.0, waveEnergy + (math.random() - 0.44) * 0.18))
         for i = 1, 5 do
-            waveValues[i] = math.floor(waveValues[i] * 0.2 + math.random(2, 20) * 0.8)
+            -- centre bars (voice frequencies) react more
+            local boost = (i == 3) and 1.5 or (i == 2 or i == 4) and 1.2 or 0.8
+            local target = math.floor(2 + waveEnergy * boost * math.random(6, 18))
+            waveValues[i] = math.floor(waveValues[i] * 0.35 + target * 0.65)
         end
         -- soft symmetry: mirror outer and inner pairs
         local avg15 = math.floor((waveValues[1] + waveValues[5]) / 2)
@@ -238,9 +245,14 @@ end)
 
 local function ensurePill(onReady)
     if pillView then
+        pillView:frame(getViewFrame())  -- reposicionar para o ecrã atual
+        pillView:alpha(1.0)
+        -- re-trigger entrance animation
+        pillView:evaluateJavaScript("(function(){var p=document.getElementById('pill');p.style.animation='none';void p.offsetWidth;p.style.animation='';})();")
         if onReady then onReady() end
         return
     end
+    -- fallback: pill not yet pre-warmed
     local frame = getViewFrame()
     pillView = hs.webview.new(frame, { developerExtrasEnabled = false })
     pillView:windowStyle({"borderless", "nonactivating"})
@@ -249,21 +261,11 @@ local function ensurePill(onReady)
     pillView:allowTextEntry(false)
     pillView:transparent(true)
     pillView:alpha(1.0)
-    if onReady then
-        local fired = false
-        local function fire()
-            if fired then return end
-            fired = true
-            if pillView then pillView:navigationCallback(nil) end
-            onReady()
-        end
-        pillView:navigationCallback(function(action)
-            if action == "didFinish" then fire() end
-        end)
-        hs.timer.doAfter(0.4, fire)  -- fallback se navigationCallback não disparar
-    end
     pillView:html(shellHTML())
     pillView:show()
+    hs.timer.doAfter(0.5, function()
+        if onReady then onReady() end
+    end)
 end
 
 local function updatePill(opts)
@@ -338,14 +340,14 @@ local function showResult(text)
     })
     if dismissTimer then dismissTimer:stop() end
     dismissTimer = hs.timer.doAfter(3.5, function()
-        if pillView then pillView:delete(); pillView = nil end
+        if pillView then pillView:alpha(0) end
         dismissTimer = nil
     end)
 end
 
 local function hidePill()
     stopLoadingSound()
-    if pillView then pillView:delete(); pillView = nil end
+    if pillView then pillView:alpha(0) end
 end
 
 -- ============================================
@@ -359,7 +361,7 @@ local function startDictation()
     targetWindow = hs.window.focusedWindow()
     targetApp    = hs.application.frontmostApplication()
 
-    escHotkey:enable()
+    escHotkey:start()
     enterHotkey:enable()
     shiftHotkey:start()
 
@@ -381,7 +383,7 @@ function stopDictation(autoEnter, stopSound)
     if not isRecording then return end
     if autoEnter == nil then autoEnter = AUTO_ENTER end
     isRecording = false
-    escHotkey:disable()
+    escHotkey:stop()
     enterHotkey:disable()
     shiftHotkey:stop()
 
@@ -432,7 +434,7 @@ end
 local function cancelDictation()
     if not isRecording then return end
     isRecording = false
-    escHotkey:disable()
+    escHotkey:stop()
     enterHotkey:disable()
     shiftHotkey:stop()
     if recTask and recTask:isRunning() then recTask:terminate() end
@@ -454,9 +456,14 @@ hs.hotkey.bind({"cmd", "alt"}, "L", function()
     end
 end)
 
--- Escape hotkey — enabled/disabled dynamically with recording state
-escHotkey = hs.hotkey.new({}, "escape", function()
-    cancelDictation()
+-- Escape eventtap — captura o Esc a nível baixo (antes do webview interceptar)
+escHotkey = hs.eventtap.new({hs.eventtap.event.types.keyDown}, function(event)
+    if not isRecording then return false end
+    if event:getKeyCode() == 53 then  -- 53 = Escape
+        cancelDictation()
+        return true  -- consume o evento
+    end
+    return false
 end)
 
 -- Enter hotkey — para a gravação e faz auto-enter (tem prioridade sobre qualquer app)
@@ -478,4 +485,19 @@ shiftHotkey = hs.eventtap.new({hs.eventtap.event.types.flagsChanged}, function(e
 end)
 
 require("hs.ipc")
+
+-- Pré-aquecer o webview no startup (alpha=0) para evitar atraso na primeira gravação
+hs.timer.doAfter(0.8, function()
+    local frame = getViewFrame()
+    pillView = hs.webview.new(frame, { developerExtrasEnabled = false })
+    pillView:windowStyle({"borderless", "nonactivating"})
+    pillView:level(hs.canvas.windowLevels.overlay)
+    pillView:behavior(hs.canvas.windowBehaviors.canJoinAllSpaces)
+    pillView:allowTextEntry(false)
+    pillView:transparent(true)
+    pillView:alpha(0)
+    pillView:html(shellHTML())
+    pillView:show()
+end)
+
 hs.printf("Whisper Dictation loaded — \xe2\x8c\xa5\xe2\x8c\x98L toggle (webview pill v4)")
