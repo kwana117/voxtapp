@@ -17,28 +17,72 @@ local enterHotkey = nil
 local shiftHotkey = nil
 local targetWindow = nil
 local targetApp = nil
-local loadingSound = nil
+local dismissTimer = nil
+local beatTimer = nil
+local beatIndex = 0
+local BEAT_INTERVAL = 0.45  -- ~133 BPM
+local BEAT_PATTERN  = {true, true, false, false, true, false, false, false}
+local waveTimer = nil
+local waveValues = {8, 12, 16, 12, 8}
 
 -- ============================================
 -- Sound feedback
 -- ============================================
+local soundsDir = os.getenv("HOME") .. "/.hammerspoon/sounds/"
+
 local function playSound(name, vol)
     local s = hs.sound.getByName(name)
     if s then s:volume(vol or 0.5); s:play() end
 end
 
+local function playSoundFile(filename, vol)
+    local s = hs.sound.getByFile(soundsDir .. filename)
+    if s then s:volume(vol or 0.5); s:play() end
+end
+
 local function stopLoadingSound()
-    if loadingSound then loadingSound:stop(); loadingSound = nil end
+    if beatTimer then beatTimer:stop(); beatTimer = nil end
+    beatIndex = 0
 end
 
 local function startLoadingSound()
     stopLoadingSound()
-    loadingSound = hs.sound.getByName("Purr")
-    if loadingSound then
-        loadingSound:volume(0.18)
-        loadingSound:looping(true)
-        loadingSound:play()
-    end
+    -- beat 1 fires immediately, then timer handles beats 2–8 and loop
+    playSoundFile("bong-001.mp3", 0.35)
+    beatIndex = 1
+    beatTimer = hs.timer.doEvery(BEAT_INTERVAL, function()
+        beatIndex = (beatIndex % 8) + 1
+        if BEAT_PATTERN[beatIndex] then
+            playSoundFile("bong-001.mp3", 0.35)
+        end
+    end)
+end
+
+-- ============================================
+-- Wave animation (JS-driven smooth random walk)
+-- ============================================
+local function stopWaveAnimation()
+    if waveTimer then waveTimer:stop(); waveTimer = nil end
+end
+
+local function startWaveAnimation()
+    stopWaveAnimation()
+    waveValues = {8, 12, 16, 12, 8}
+    waveTimer = hs.timer.doEvery(0.08, function()
+        if not pillView or not isRecording then return end
+        for i = 1, 5 do
+            waveValues[i] = math.floor(waveValues[i] * 0.2 + math.random(2, 20) * 0.8)
+        end
+        -- soft symmetry: mirror outer and inner pairs
+        local avg15 = math.floor((waveValues[1] + waveValues[5]) / 2)
+        waveValues[1] = avg15; waveValues[5] = avg15
+        local avg24 = math.floor((waveValues[2] + waveValues[4]) / 2)
+        waveValues[2] = avg24; waveValues[4] = avg24
+        pillView:evaluateJavaScript(string.format(
+            "(function(){var b=document.querySelectorAll('.wave b'),h=[%d,%d,%d,%d,%d];for(var i=0;i<5;i++){if(b[i])b[i].style.height=h[i]+'px';}})();",
+            waveValues[1], waveValues[2], waveValues[3], waveValues[4], waveValues[5]
+        ))
+    end)
 end
 
 -- ============================================
@@ -118,23 +162,15 @@ local function shellHTML()
                 height: 20px;
             }
             .wave.hidden { display: none; }
-            @keyframes waveBar {
-                from { height: 3px;  opacity: 0.5; }
-                to   { height: 16px; opacity: 1.0; }
-            }
             .wave b {
                 display: block;
                 width: 3px;
                 border-radius: 2px;
                 background: #ff5252;
                 box-shadow: 0 0 5px rgba(255,82,82,0.55);
-                animation: waveBar 0.65s ease-in-out infinite alternate;
+                height: 4px;
+                transition: height 0.09s ease-out;
             }
-            .wave b:nth-child(1) { animation-delay: 0.00s; }
-            .wave b:nth-child(2) { animation-delay: 0.11s; }
-            .wave b:nth-child(3) { animation-delay: 0.22s; }
-            .wave b:nth-child(4) { animation-delay: 0.11s; }
-            .wave b:nth-child(5) { animation-delay: 0.00s; }
             /* === Spinner (transcribing state) === */
             .spinner {
                 width: 14px;
@@ -200,8 +236,11 @@ hs.urlevent.bind("stop", function()
     if isRecording then stopDictation() end
 end)
 
-local function ensurePill()
-    if pillView then return end
+local function ensurePill(onReady)
+    if pillView then
+        if onReady then onReady() end
+        return
+    end
     local frame = getViewFrame()
     pillView = hs.webview.new(frame, { developerExtrasEnabled = false })
     pillView:windowStyle({"borderless", "nonactivating"})
@@ -210,6 +249,19 @@ local function ensurePill()
     pillView:allowTextEntry(false)
     pillView:transparent(true)
     pillView:alpha(1.0)
+    if onReady then
+        local fired = false
+        local function fire()
+            if fired then return end
+            fired = true
+            if pillView then pillView:navigationCallback(nil) end
+            onReady()
+        end
+        pillView:navigationCallback(function(action)
+            if action == "didFinish" then fire() end
+        end)
+        hs.timer.doAfter(0.4, fire)  -- fallback se navigationCallback não disparar
+    end
     pillView:html(shellHTML())
     pillView:show()
 end
@@ -276,7 +328,7 @@ end
 
 local function showResult(text)
     stopLoadingSound()
-    playSound("Glass", 0.5)
+    playSoundFile("confirmation-001.mp3", 0.8)
     if not text or text == "" then text = "(no text detected)" end
     if #text > 42 then text = text:sub(1, 39) .. "..." end
     updatePill({
@@ -284,8 +336,10 @@ local function showResult(text)
         bg    = "rgba(22, 34, 26, 0.82)",
         color = "rgba(120, 240, 160, 0.92)",
     })
-    hs.timer.doAfter(3.5, function()
+    if dismissTimer then dismissTimer:stop() end
+    dismissTimer = hs.timer.doAfter(3.5, function()
         if pillView then pillView:delete(); pillView = nil end
+        dismissTimer = nil
     end)
 end
 
@@ -309,9 +363,12 @@ local function startDictation()
     enterHotkey:enable()
     shiftHotkey:start()
 
-    playSound("Tink", 0.45)
-    ensurePill()
-    hs.timer.doAfter(0.1, showRecording)
+    if dismissTimer then dismissTimer:stop(); dismissTimer = nil end
+    playSoundFile("confirmation-001.mp3", 0.8)
+    ensurePill(function()
+        showRecording()
+        startWaveAnimation()
+    end)
 
     recTask = hs.task.new("/opt/homebrew/bin/rec", function() end, {
         "-r", "16000", "-c", "1", "-b", "16", "/tmp/dictation.wav",
@@ -320,7 +377,7 @@ local function startDictation()
 end
 
 -- Forward-declared above ensurePill so policyCallback can reference it
-function stopDictation(autoEnter)
+function stopDictation(autoEnter, stopSound)
     if not isRecording then return end
     if autoEnter == nil then autoEnter = AUTO_ENTER end
     isRecording = false
@@ -331,7 +388,12 @@ function stopDictation(autoEnter)
     if recTask and recTask:isRunning() then recTask:terminate() end
     recTask = nil
 
-    playSound("Pop", 0.35)
+    stopWaveAnimation()
+    if stopSound then
+        playSoundFile(stopSound, 0.8)
+    else
+        playSound("Pop", 0.35)
+    end
     showTranscribing()
     startLoadingSound()
 
@@ -375,6 +437,8 @@ local function cancelDictation()
     shiftHotkey:stop()
     if recTask and recTask:isRunning() then recTask:terminate() end
     recTask = nil
+    stopWaveAnimation()
+    playSoundFile("question-004.mp3", 0.7)
     hidePill()
     os.remove("/tmp/dictation.wav")
 end
@@ -397,7 +461,7 @@ end)
 
 -- Enter hotkey — para a gravação e faz auto-enter (tem prioridade sobre qualquer app)
 enterHotkey = hs.hotkey.new({}, "return", function()
-    if isRecording then stopDictation(true) end
+    if isRecording then stopDictation(true, "confirmation-002.mp3") end
 end)
 
 -- Shift key tap — para a gravação e cola o texto SEM fazer Enter
