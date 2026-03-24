@@ -25,6 +25,10 @@ local BEAT_PATTERN  = {true, true, false, false}
 local waveTimer = nil
 local waveValues = {8, 12, 16, 12, 8}
 local waveEnergy = 0.3
+local recordingStartTime = nil       -- timestamp when recording started
+local isTranscribing = false          -- true while whisper is running
+local transcribeTask = nil            -- hs.task for dictate.sh (so ESC can kill it)
+local MIN_RECORD_SECS = 1.5          -- ignore Enter/Shift before this
 
 -- ============================================
 -- Sound feedback
@@ -335,6 +339,7 @@ local function showTranscribing()
         bg          = "rgba(24, 26, 40, 0.82)",
         color       = "rgba(140, 170, 255, 0.92)",
         showSpinner = true,
+        badge       = "ESC Cancel",
     })
 end
 
@@ -376,6 +381,7 @@ local function startDictation()
     shiftHotkey:start()
 
     if dismissTimer then dismissTimer:stop(); dismissTimer = nil end
+    recordingStartTime = hs.timer.secondsSinceEpoch()
     playSoundFile("confirmation-001.mp3", 0.8)
     ensurePill(function()
         showRecording()
@@ -388,12 +394,17 @@ local function startDictation()
     recTask:start()
 end
 
+local function hasMinRecordingTime()
+    if not recordingStartTime then return false end
+    return (hs.timer.secondsSinceEpoch() - recordingStartTime) >= MIN_RECORD_SECS
+end
+
 -- Forward-declared above ensurePill so policyCallback can reference it
 function stopDictation(autoEnter, stopSound)
     if not isRecording then return end
     if autoEnter == nil then autoEnter = AUTO_ENTER end
     isRecording = false
-    escHotkey:stop()
+    -- Keep escHotkey running so ESC can cancel transcription
     enterHotkey:disable()
     shiftHotkey:stop()
 
@@ -401,6 +412,7 @@ function stopDictation(autoEnter, stopSound)
     recTask = nil
 
     stopWaveAnimation()
+    recordingStartTime = nil
     if stopSound then
         playSoundFile(stopSound, 0.8)
     else
@@ -408,8 +420,9 @@ function stopDictation(autoEnter, stopSound)
     end
     showTranscribing()
     startLoadingSound()
+    isTranscribing = true
 
-    hs.task.new("/bin/bash", function(code, out, err)
+    transcribeTask = hs.task.new("/bin/bash", function(code, out, err)
         local result = ""
         local rf = io.open("/tmp/dictation.result", "r")
         if rf then
@@ -437,6 +450,9 @@ function stopDictation(autoEnter, stopSound)
             end)
         end
 
+        isTranscribing = false
+        transcribeTask = nil
+        escHotkey:stop()
         showResult(result ~= "" and result or nil)
     end, { dictateScript, "stop-transcribe-only" }):start()
 end
@@ -444,6 +460,7 @@ end
 local function cancelDictation()
     if not isRecording then return end
     isRecording = false
+    recordingStartTime = nil
     escHotkey:stop()
     enterHotkey:disable()
     shiftHotkey:stop()
@@ -453,6 +470,21 @@ local function cancelDictation()
     playSoundFile("question-004.mp3", 0.7)
     hidePill()
     os.remove("/tmp/dictation.wav")
+end
+
+local function cancelTranscription()
+    if not isTranscribing then return end
+    isTranscribing = false
+    if transcribeTask and transcribeTask:isRunning() then transcribeTask:terminate() end
+    transcribeTask = nil
+    stopLoadingSound()
+    playSoundFile("question-004.mp3", 0.7)
+    hidePill()
+    os.remove("/tmp/dictation.wav")
+    os.remove("/tmp/dictation.result")
+    os.remove("/tmp/dictation.txt")
+    targetWindow = nil
+    targetApp = nil
 end
 
 -- ============================================
@@ -467,29 +499,41 @@ hs.hotkey.bind({"cmd", "alt"}, "L", function()
 end)
 
 -- Escape eventtap — captura o Esc a nível baixo (antes do webview interceptar)
+-- Cancels recording OR transcription
 escHotkey = hs.eventtap.new({hs.eventtap.event.types.keyDown}, function(event)
-    if not isRecording then return false end
-    if event:getKeyCode() == 53 then  -- 53 = Escape
+    if event:getKeyCode() ~= 53 then return false end  -- 53 = Escape
+    if isRecording then
         cancelDictation()
-        return true  -- consume o evento
+        return true
+    end
+    if isTranscribing then
+        cancelTranscription()
+        return true
     end
     return false
 end)
 
 -- Enter hotkey — para a gravação e faz auto-enter (tem prioridade sobre qualquer app)
+-- Ignores press if recording is shorter than MIN_RECORD_SECS (prevents accidental stops)
 enterHotkey = hs.hotkey.new({}, "return", function()
-    if isRecording then stopDictation(true, "confirmation-002.mp3") end
+    if isRecording and hasMinRecordingTime() then
+        stopDictation(true, "confirmation-002.mp3")
+    end
 end)
 
 -- Shift key tap — para a gravação e cola o texto SEM fazer Enter
 -- Uses eventtap to detect shift key press (since shift alone isn't a regular hotkey)
+-- Ignores press if recording is shorter than MIN_RECORD_SECS (prevents accidental stops)
 shiftHotkey = hs.eventtap.new({hs.eventtap.event.types.flagsChanged}, function(event)
     if not isRecording then return false end
     local flags = event:getFlags()
     -- Detect shift key press (not release), and no other modifiers
     if flags.shift and not flags.cmd and not flags.alt and not flags.ctrl then
-        stopDictation(false)
-        return true  -- consume the event
+        if hasMinRecordingTime() then
+            stopDictation(false)
+            return true  -- consume the event
+        end
+        return true  -- consume but ignore (too early)
     end
     return false
 end)
