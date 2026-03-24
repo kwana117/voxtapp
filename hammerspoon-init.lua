@@ -112,6 +112,16 @@ local function getViewFrame()
     )
 end
 
+-- Frame off-screen to avoid intercepting clicks when hidden
+local OFF_SCREEN_FRAME = hs.geometry.rect(-9999, -9999, VIEW_W, VIEW_H)
+
+local function movePillOffScreen()
+    if pillView then
+        pillView:alpha(0)
+        pillView:frame(OFF_SCREEN_FRAME)
+    end
+end
+
 -- ============================================
 -- HTML shell (pill centred inside padded webview)
 -- ============================================
@@ -340,14 +350,14 @@ local function showResult(text)
     })
     if dismissTimer then dismissTimer:stop() end
     dismissTimer = hs.timer.doAfter(3.5, function()
-        if pillView then pillView:alpha(0) end
+        movePillOffScreen()
         dismissTimer = nil
     end)
 end
 
 local function hidePill()
     stopLoadingSound()
-    if pillView then pillView:alpha(0) end
+    movePillOffScreen()
 end
 
 -- ============================================
@@ -496,6 +506,7 @@ hs.timer.doAfter(0.8, function()
     pillView:allowTextEntry(false)
     pillView:transparent(true)
     pillView:alpha(0)
+    pillView:frame(OFF_SCREEN_FRAME)  -- start off-screen to avoid click interception
     pillView:html(shellHTML())
     pillView:show()
 end)
