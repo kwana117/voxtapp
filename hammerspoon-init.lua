@@ -30,6 +30,15 @@ local isTranscribing = false          -- true while whisper is running
 local transcribeTask = nil            -- hs.task for dictate.sh (so ESC can kill it)
 local MIN_RECORD_SECS = 1.5          -- ignore Enter/Shift before this
 
+-- Smart paste: pending state when user switched windows
+local pendingResult = nil             -- transcribed text waiting to be pasted
+local pendingAutoEnter = nil          -- whether to auto-enter when accepted
+local highlightCanvas = nil           -- hs.canvas border around original window
+local highlightPulseTimer = nil       -- timer for pulsing animation
+local pendingTimer = nil              -- timeout to dismiss pending state
+local pendingWindowWatcher = nil      -- hs.timer to watch for window refocus
+local PENDING_TIMEOUT = 60            -- seconds before pending state auto-dismisses
+
 -- ============================================
 -- Sound feedback
 -- ============================================
@@ -321,6 +330,120 @@ local function updatePill(opts)
 end
 
 -- ============================================
+-- Window highlight (glowing border around original window)
+-- ============================================
+local HIGHLIGHT_COLOR   = {red = 1, green = 0.72, blue = 0.2, alpha = 0.9}   -- amber/gold
+local HIGHLIGHT_DIM     = {red = 1, green = 0.72, blue = 0.2, alpha = 0.35}
+local HIGHLIGHT_BORDER  = 3
+local HIGHLIGHT_RADIUS  = 10
+
+local function removeWindowHighlight()
+    if highlightPulseTimer then highlightPulseTimer:stop(); highlightPulseTimer = nil end
+    if highlightCanvas then highlightCanvas:delete(); highlightCanvas = nil end
+end
+
+local function drawWindowHighlight(win)
+    removeWindowHighlight()
+    if not win then return end
+    local f = win:frame()
+    if not f then return end
+
+    local pad = HIGHLIGHT_BORDER + 2
+    highlightCanvas = hs.canvas.new(hs.geometry.rect(
+        f.x - pad, f.y - pad,
+        f.w + pad * 2, f.h + pad * 2
+    ))
+    highlightCanvas:level(hs.canvas.windowLevels.overlay)
+    highlightCanvas:behavior(hs.canvas.windowBehaviors.canJoinAllSpaces)
+    highlightCanvas:clickActivating(false)
+    highlightCanvas:canvasMouseEvents(false)
+
+    highlightCanvas[1] = {
+        type             = "rectangle",
+        action           = "stroke",
+        strokeColor      = HIGHLIGHT_COLOR,
+        strokeWidth      = HIGHLIGHT_BORDER,
+        roundedRectRadii = {xRadius = HIGHLIGHT_RADIUS, yRadius = HIGHLIGHT_RADIUS},
+        frame            = {x = pad - HIGHLIGHT_BORDER/2, y = pad - HIGHLIGHT_BORDER/2,
+                            w = f.w + HIGHLIGHT_BORDER, h = f.h + HIGHLIGHT_BORDER},
+    }
+    highlightCanvas:show()
+
+    -- Pulse animation: alternate bright/dim
+    local bright = true
+    highlightPulseTimer = hs.timer.doEvery(0.8, function()
+        if not highlightCanvas then return end
+        bright = not bright
+        highlightCanvas[1].strokeColor = bright and HIGHLIGHT_COLOR or HIGHLIGHT_DIM
+    end)
+end
+
+-- ============================================
+-- Pending state management (text ready but wrong window)
+-- ============================================
+local function dismissPending()
+    pendingResult = nil
+    pendingAutoEnter = nil
+    removeWindowHighlight()
+    escHotkey:stop()
+    if pendingTimer then pendingTimer:stop(); pendingTimer = nil end
+    if pendingWindowWatcher then pendingWindowWatcher:stop(); pendingWindowWatcher = nil end
+    targetWindow = nil
+    targetApp = nil
+    movePillOffScreen()
+end
+
+local function acceptPending()
+    if not pendingResult then return end
+    local text = pendingResult
+    local autoEnter = pendingAutoEnter
+
+    -- Clean up pending state first
+    pendingResult = nil
+    pendingAutoEnter = nil
+    removeWindowHighlight()
+    escHotkey:stop()
+    if pendingTimer then pendingTimer:stop(); pendingTimer = nil end
+    if pendingWindowWatcher then pendingWindowWatcher:stop(); pendingWindowWatcher = nil end
+    targetWindow = nil
+    targetApp = nil
+
+    -- Text is already in clipboard from transcription
+    hs.eventtap.keyStroke({"cmd"}, "v")
+    if autoEnter then
+        hs.timer.doAfter(0.05, function()
+            hs.eventtap.keyStroke({}, "return")
+        end)
+    end
+
+    -- Show green confirmation
+    showResult(text)
+end
+
+local function startPendingState(text, autoEnter)
+    pendingResult = text
+    pendingAutoEnter = autoEnter
+
+    -- Draw highlight around original window
+    drawWindowHighlight(targetWindow)
+
+    -- Watch for user returning to original window → auto-paste
+    if pendingWindowWatcher then pendingWindowWatcher:stop() end
+    pendingWindowWatcher = hs.timer.doEvery(0.5, function()
+        local fw = hs.window.focusedWindow()
+        if fw and targetWindow and fw:id() == targetWindow:id() then
+            acceptPending()
+        end
+    end)
+
+    -- Timeout: dismiss after PENDING_TIMEOUT seconds
+    if pendingTimer then pendingTimer:stop() end
+    pendingTimer = hs.timer.doAfter(PENDING_TIMEOUT, function()
+        dismissPending()
+    end)
+end
+
+-- ============================================
 -- States
 -- ============================================
 local function showRecording()
@@ -358,6 +481,20 @@ local function showResult(text)
         movePillOffScreen()
         dismissTimer = nil
     end)
+end
+
+local function showPending(text)
+    stopLoadingSound()
+    playSoundFile("question-004.mp3", 0.5)
+    if not text or text == "" then text = "(no text detected)" end
+    local preview = text
+    if #preview > 30 then preview = preview:sub(1, 27) .. "..." end
+    updatePill({
+        text  = "\xe2\x8f\xb3 " .. preview,
+        bg    = "rgba(40, 32, 16, 0.88)",
+        color = "rgba(255, 200, 80, 0.95)",
+        badge = "\xe2\x8c\xa5\xe2\x8c\x98L Paste",
+    })
 end
 
 local function hidePill()
@@ -432,28 +569,41 @@ function stopDictation(autoEnter, stopSound)
         end
 
         if result ~= "" then
-            -- Focar janela original e colar
-            if targetWindow then
-                targetWindow:focus()
-            elseif targetApp then
-                targetApp:activate(true)
-            end
-            hs.timer.doAfter(0.3, function()
-                hs.eventtap.keyStroke({"cmd"}, "v")
-                if autoEnter then
-                    hs.timer.doAfter(0.05, function()
-                        hs.eventtap.keyStroke({}, "return")
-                    end)
-                end
-                targetWindow = nil
-                targetApp    = nil
-            end)
-        end
+            -- Smart paste: check if user is still in the original window
+            local currentWindow = hs.window.focusedWindow()
+            local sameWindow = (currentWindow and targetWindow
+                                and currentWindow:id() == targetWindow:id())
 
-        isTranscribing = false
-        transcribeTask = nil
-        escHotkey:stop()
-        showResult(result ~= "" and result or nil)
+            if sameWindow then
+                -- Same window → paste immediately (original behaviour)
+                hs.timer.doAfter(0.15, function()
+                    hs.eventtap.keyStroke({"cmd"}, "v")
+                    if autoEnter then
+                        hs.timer.doAfter(0.05, function()
+                            hs.eventtap.keyStroke({}, "return")
+                        end)
+                    end
+                    targetWindow = nil
+                    targetApp    = nil
+                end)
+                isTranscribing = false
+                transcribeTask = nil
+                escHotkey:stop()
+                showResult(result)
+            else
+                -- Different window → enter pending state
+                -- Keep escHotkey running so ESC can dismiss pending
+                isTranscribing = false
+                transcribeTask = nil
+                showPending(result)
+                startPendingState(result, autoEnter)
+            end
+        else
+            isTranscribing = false
+            transcribeTask = nil
+            escHotkey:stop()
+            showResult(nil)
+        end
     end, { dictateScript, "stop-transcribe-only" }):start()
 end
 
@@ -491,7 +641,10 @@ end
 -- Hotkeys
 -- ============================================
 hs.hotkey.bind({"cmd", "alt"}, "L", function()
-    if isRecording then
+    if pendingResult then
+        -- Accept pending transcription → paste in current window
+        acceptPending()
+    elseif isRecording then
         stopDictation()
     else
         startDictation()
@@ -502,6 +655,10 @@ end)
 -- Cancels recording OR transcription
 escHotkey = hs.eventtap.new({hs.eventtap.event.types.keyDown}, function(event)
     if event:getKeyCode() ~= 53 then return false end  -- 53 = Escape
+    if pendingResult then
+        dismissPending()
+        return true
+    end
     if isRecording then
         cancelDictation()
         return true
