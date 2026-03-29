@@ -110,7 +110,7 @@ end
 -- ============================================
 local PILL_W = 320
 local PILL_H = 48
-local PAD = 20  -- extra padding around pill to hide window rect corners
+local PAD = 4   -- minimal padding (shadow clipping acceptable — avoids blocking clicks)
 local VIEW_W = PILL_W + PAD * 2
 local VIEW_H = PILL_H + PAD * 2
 local PILL_Y = 8
@@ -142,12 +142,13 @@ local function shellHTML()
     return string.format([[
         <html>
         <head><style>
-            * { margin:0; padding:0; box-sizing:border-box; }
+            * { margin:0; padding:0; box-sizing:border-box; pointer-events:none !important; }
             html, body {
                 background: transparent !important;
                 overflow: hidden;
                 width: 100%%;
                 height: 100%%;
+                -webkit-user-select: none;
             }
             .wrapper {
                 width: 100%%;
@@ -171,8 +172,8 @@ local function shellHTML()
                 border-radius: 14px;
                 border: 0.5px solid rgba(255,255,255,0.10);
                 box-shadow:
-                    0 8px 32px rgba(0,0,0,0.4),
-                    0 2px 8px rgba(0,0,0,0.25);
+                    0 2px 8px rgba(0,0,0,0.4),
+                    0 1px 3px rgba(0,0,0,0.25);
                 backdrop-filter: blur(50px) saturate(1.6);
                 -webkit-backdrop-filter: blur(50px) saturate(1.6);
                 font-family: -apple-system, BlinkMacSystemFont, sans-serif;
@@ -237,13 +238,7 @@ local function shellHTML()
                 white-space: nowrap;
                 flex-shrink: 0;
                 letter-spacing: 0.3px;
-                cursor: pointer;
-                user-select: none;
-                -webkit-user-select: none;
-                transition: background 0.15s ease;
             }
-            .badge:hover  { background: rgba(255,255,255,0.18); color: rgba(255,255,255,0.7); }
-            .badge:active { background: rgba(255,255,255,0.25); }
             .badge.hidden { display: none; }
         </style></head>
         <body>
@@ -252,19 +247,13 @@ local function shellHTML()
                     <div class="wave hidden" id="wave"><b></b><b></b><b></b><b></b><b></b></div>
                     <div class="spinner hidden" id="spinner"></div>
                     <div class="text" id="text"></div>
-                    <div class="badge hidden" id="badge"
-                         onclick="window.location='hammerspoon://stop'; return false;"></div>
+                    <div class="badge hidden" id="badge"></div>
                 </div>
             </div>
         </body>
         </html>
     ]], PAD, PILL_W, PILL_H)
 end
-
--- URL event handler for badge click
-hs.urlevent.bind("stop", function()
-    if isRecording then stopDictation() end
-end)
 
 local function ensurePill(onReady)
     if pillView then
