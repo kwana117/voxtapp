@@ -125,11 +125,15 @@ local function getViewFrame()
     )
 end
 
--- Frame off-screen to avoid intercepting clicks when hidden
+-- Hidden frame for pre-warm (off-screen as defence-in-depth; :hide() is the real protection)
 local OFF_SCREEN_FRAME = hs.geometry.rect(-9999, -9999, VIEW_W, VIEW_H)
 
+-- Properly hide the NSWindow so it leaves the window list and stops intercepting clicks.
+-- Setting alpha(0) + moving off-screen is NOT enough on macOS: the window stays in the
+-- window server's hit-test stack and silently swallows clicks at its last on-screen frame.
 local function movePillOffScreen()
     if pillView then
+        pillView:hide()
         pillView:alpha(0)
         pillView:frame(OFF_SCREEN_FRAME)
     end
@@ -259,6 +263,7 @@ local function ensurePill(onReady)
     if pillView then
         pillView:frame(getViewFrame())  -- reposicionar para o ecrã atual
         pillView:alpha(1.0)
+        pillView:show()                  -- bring window back into the window list
         -- re-trigger entrance animation
         pillView:evaluateJavaScript("(function(){var p=document.getElementById('pill');p.style.animation='none';void p.offsetWidth;p.style.animation='';})();")
         if onReady then onReady() end
@@ -686,19 +691,23 @@ end)
 
 require("hs.ipc")
 
--- Pré-aquecer o webview no startup (alpha=0) para evitar atraso na primeira gravação
+-- Pré-aquecer o webview no startup para evitar atraso na primeira gravação.
+-- Cria-se directamente OFF_SCREEN para nunca aparecer no top-center antes de :hide(),
+-- mostra-se brevemente para inicializar o WKWebView, e esconde-se com :hide() (orderOut)
+-- para garantir que sai da window list e não intercepta cliques.
 hs.timer.doAfter(0.8, function()
-    local frame = getViewFrame()
-    pillView = hs.webview.new(frame, { developerExtrasEnabled = false })
+    pillView = hs.webview.new(OFF_SCREEN_FRAME, { developerExtrasEnabled = false })
     pillView:windowStyle({"borderless", "nonactivating"})
     pillView:level(hs.canvas.windowLevels.overlay)
     pillView:behavior(hs.canvas.windowBehaviors.canJoinAllSpaces)
     pillView:allowTextEntry(false)
     pillView:transparent(true)
     pillView:alpha(0)
-    pillView:frame(OFF_SCREEN_FRAME)  -- start off-screen to avoid click interception
     pillView:html(shellHTML())
-    pillView:show()
+    pillView:show()        -- brief show off-screen+invisible to attach WKWebView
+    hs.timer.doAfter(0.1, function()
+        if pillView then pillView:hide() end
+    end)
 end)
 
 hs.printf("Whisper Dictation loaded — \xe2\x8c\xa5\xe2\x8c\x98L toggle (webview pill v4)")
