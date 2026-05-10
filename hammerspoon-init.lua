@@ -3,7 +3,8 @@
 -- Floating macOS pill via hs.webview
 -- ============================================
 
-local dictateScript = os.getenv("HOME") .. "/scripts/dictate.sh"
+local dictateScript        = os.getenv("HOME") .. "/scripts/dictate.sh"
+local recordChunksScript   = os.getenv("HOME") .. "/scripts/record-chunks.sh"
 
 -- ============================================
 -- Configuração
@@ -11,7 +12,6 @@ local dictateScript = os.getenv("HOME") .. "/scripts/dictate.sh"
 local AUTO_ENTER = true
 local isRecording = false
 local pillView = nil
-local recTask = nil
 local escHotkey = nil
 local enterHotkey = nil
 local shiftHotkey = nil
@@ -27,8 +27,32 @@ local waveValues = {8, 12, 16, 12, 8}
 local waveEnergy = 0.3
 local recordingStartTime = nil       -- timestamp when recording started
 local isTranscribing = false          -- true while whisper is running
-local transcribeTask = nil            -- hs.task for dictate.sh (so ESC can kill it)
 local MIN_RECORD_SECS = 1.5          -- ignore Enter/Shift before this
+
+-- ============================================
+-- Chunked recording / transcription
+-- ============================================
+-- Strategy: ffmpeg's segment muxer rotates files every CHUNK_SECS seconds
+-- without dropping samples. As soon as a chunk finalises, we kick off whisper
+-- on it (sequentially, one at a time, to avoid CPU contention). Each chunk is
+-- enriched with the trailing OVERLAP_SECS of the previous chunk so a word
+-- split across a boundary appears intact in the next transcription. The
+-- downstream consumer (an LLM) handles the resulting word duplications.
+local CHUNK_DIR     = "/tmp/voxt-chunks"
+local CHUNK_SECS    = 18
+local OVERLAP_SECS  = 3
+
+local recPipelineTask    = nil   -- hs.task for record-chunks.sh
+local recPipelineDone    = false -- true once recording bash script has exited
+local chunkWatcher       = nil   -- hs.pathwatcher on CHUNK_DIR
+local seenChunks         = {}    -- map: idx → true (chunk file has appeared)
+local finalisedChunks    = {}    -- map: idx → true (file fully written + closed)
+local transcribedChunks  = {}    -- map: idx → text
+local chunkQueue         = {}    -- ordered list of indices waiting for whisper
+local activeChunkTask    = nil   -- hs.task running whisper on a chunk
+local pendingEnrichTask  = nil   -- hs.task running sox to build enriched chunk
+local pendingFinalize    = nil   -- nil | { autoEnter = bool }
+local cancelRequested    = false
 
 -- Smart paste: pending state when user switched windows
 local pendingResult = nil             -- transcribed text waiting to be pasted
@@ -497,8 +521,214 @@ local function hidePill()
 end
 
 -- ============================================
--- Dictation control
+-- Dictation control (chunked pipeline)
 -- ============================================
+
+local function chunkPath(idx)
+    return string.format("%s/chunk_%03d.wav", CHUNK_DIR, idx)
+end
+
+local function enrichedPath(idx)
+    return string.format("%s/_enriched_%03d.wav", CHUNK_DIR, idx)
+end
+
+local function chunkOutBase(idx)
+    return string.format("%s/chunk_%03d", CHUNK_DIR, idx)
+end
+
+local function listChunkIndices()
+    local idxs = {}
+    local iter = hs.fs.dir(CHUNK_DIR)
+    if not iter then return idxs end
+    for f in iter do
+        local n = f:match("^chunk_(%d+)%.wav$")
+        if n then table.insert(idxs, tonumber(n)) end
+    end
+    table.sort(idxs)
+    return idxs
+end
+
+local function resetChunkState()
+    chunkQueue        = {}
+    seenChunks        = {}
+    finalisedChunks   = {}
+    transcribedChunks = {}
+    pendingFinalize   = nil
+    cancelRequested   = false
+    recPipelineDone   = false
+end
+
+-- Forward-declared because of mutual recursion via callbacks.
+local processNextChunk
+local maybeFinalize
+
+local function transcribeChunkAt(idx, done)
+    local current = chunkPath(idx)
+    if not hs.fs.attributes(current) then
+        transcribedChunks[idx] = ""
+        done()
+        return
+    end
+
+    local function runWhisper(input)
+        local outBase = chunkOutBase(idx)
+        os.remove(outBase .. ".txt")
+        activeChunkTask = hs.task.new("/bin/bash", function(_code, _out, _err)
+            activeChunkTask = nil
+            local txt = ""
+            local rf = io.open(outBase .. ".txt", "r")
+            if rf then
+                txt = rf:read("*a"):gsub("^%s+", ""):gsub("%s+$", "")
+                rf:close()
+            end
+            if txt == "[BLANK_AUDIO]" then txt = "" end
+            transcribedChunks[idx] = txt
+            os.remove(enrichedPath(idx))
+            done()
+        end, { dictateScript, "transcribe-chunk", input, outBase })
+        activeChunkTask:start()
+    end
+
+    -- For idx 0 there is no previous chunk → no overlap.
+    if idx == 0 then
+        runWhisper(current)
+        return
+    end
+
+    local prev = chunkPath(idx - 1)
+    if not hs.fs.attributes(prev) then
+        runWhisper(current)
+        return
+    end
+
+    -- Build enriched chunk = last OVERLAP_SECS of prev + all of current.
+    -- Run via /bin/bash so we can pipe sox commands.
+    local enriched = enrichedPath(idx)
+    local tailFile = string.format("%s/_tail_%03d.wav", CHUNK_DIR, idx)
+    local cmd = string.format(
+        "/opt/homebrew/bin/sox %q %q trim -%d 2>/dev/null && " ..
+        "/opt/homebrew/bin/sox %q %q %q 2>/dev/null; " ..
+        "rm -f %q",
+        prev, tailFile, OVERLAP_SECS,
+        tailFile, current, enriched,
+        tailFile
+    )
+    pendingEnrichTask = hs.task.new("/bin/bash", function(_code, _out, _err)
+        pendingEnrichTask = nil
+        if hs.fs.attributes(enriched) then
+            runWhisper(enriched)
+        else
+            -- Enrichment failed: transcribe plain chunk so we never lose audio.
+            runWhisper(current)
+        end
+    end, { "-c", cmd })
+    pendingEnrichTask:start()
+end
+
+processNextChunk = function()
+    if cancelRequested then return end
+    if activeChunkTask or pendingEnrichTask then return end
+    if #chunkQueue == 0 then
+        maybeFinalize()
+        return
+    end
+    local idx = table.remove(chunkQueue, 1)
+    transcribeChunkAt(idx, function() processNextChunk() end)
+end
+
+local function enqueueChunk(idx)
+    if finalisedChunks[idx] then return end
+    finalisedChunks[idx] = true
+    table.insert(chunkQueue, idx)
+    table.sort(chunkQueue)
+    processNextChunk()
+end
+
+maybeFinalize = function()
+    if cancelRequested then return end
+    if not recPipelineDone then return end
+    if not pendingFinalize then return end
+    if activeChunkTask or pendingEnrichTask then return end
+    if #chunkQueue > 0 then return end
+
+    -- Assemble full transcription in chunk order (with intentional overlap
+    -- duplications — downstream LLM dedupes naturally).
+    local indices = listChunkIndices()
+    local parts = {}
+    for _, idx in ipairs(indices) do
+        local txt = transcribedChunks[idx]
+        if txt and txt ~= "" then
+            table.insert(parts, txt)
+        end
+    end
+    local result = table.concat(parts, " ")
+        :gsub("%s+", " ")
+        :gsub("^%s+", "")
+        :gsub("%s+$", "")
+
+    local autoEnter = pendingFinalize.autoEnter
+    pendingFinalize = nil
+
+    if chunkWatcher then chunkWatcher:stop(); chunkWatcher = nil end
+
+    if result ~= "" then
+        hs.pasteboard.setContents(result)
+        local currentWindow = hs.window.focusedWindow()
+        local sameWindow = (currentWindow and targetWindow
+                            and currentWindow:id() == targetWindow:id())
+        if sameWindow then
+            hs.timer.doAfter(0.15, function()
+                hs.eventtap.keyStroke({"cmd"}, "v")
+                if autoEnter then
+                    hs.timer.doAfter(0.05, function()
+                        hs.eventtap.keyStroke({}, "return")
+                    end)
+                end
+                targetWindow = nil
+                targetApp    = nil
+            end)
+            isTranscribing = false
+            escHotkey:stop()
+            showResult(result)
+        else
+            isTranscribing = false
+            showPending(result)
+            startPendingState(result, autoEnter)
+        end
+    else
+        isTranscribing = false
+        escHotkey:stop()
+        showResult(nil)
+    end
+end
+
+local function onChunkDirChange(_paths, _flags)
+    -- ffmpeg's segment muxer only opens chunk_(N+1).wav after closing chunk_N.
+    -- So the appearance of chunk_(N+1) is the signal that chunk_N is final.
+    local idxs = listChunkIndices()
+    for _, idx in ipairs(idxs) do
+        if not seenChunks[idx] then
+            seenChunks[idx] = true
+            if idx > 0 then
+                enqueueChunk(idx - 1)
+            end
+        end
+    end
+end
+
+local function onRecPipelineExit(_code, _out, _err)
+    recPipelineTask = nil
+    -- The bash script's cleanup trap waits for ffmpeg to flush the last chunk
+    -- before exiting. So when we get here, the highest-indexed chunk file is
+    -- final too. Mark it for transcription.
+    local idxs = listChunkIndices()
+    if #idxs > 0 then
+        enqueueChunk(idxs[#idxs])
+    end
+    recPipelineDone = true
+    processNextChunk()
+end
+
 local function startDictation()
     if isRecording then return end
     isRecording = true
@@ -513,16 +743,23 @@ local function startDictation()
 
     if dismissTimer then dismissTimer:stop(); dismissTimer = nil end
     recordingStartTime = hs.timer.secondsSinceEpoch()
+    resetChunkState()
     playSoundFile("confirmation-001.mp3", 0.8)
     ensurePill(function()
         showRecording()
         startWaveAnimation()
     end)
 
-    recTask = hs.task.new("/opt/homebrew/bin/rec", function() end, {
-        "-r", "16000", "-c", "1", "-b", "16", "/tmp/dictation.wav",
-    })
-    recTask:start()
+    hs.execute(string.format("mkdir -p %q", CHUNK_DIR))
+    -- pathwatcher must attach AFTER the dir exists.
+    chunkWatcher = hs.pathwatcher.new(CHUNK_DIR, onChunkDirChange):start()
+
+    recPipelineTask = hs.task.new(
+        "/bin/bash",
+        onRecPipelineExit,
+        { recordChunksScript, CHUNK_DIR, tostring(CHUNK_SECS) }
+    )
+    recPipelineTask:start()
 end
 
 local function hasMinRecordingTime()
@@ -539,9 +776,6 @@ function stopDictation(autoEnter, stopSound)
     enterHotkey:disable()
     shiftHotkey:stop()
 
-    if recTask and recTask:isRunning() then recTask:terminate() end
-    recTask = nil
-
     stopWaveAnimation()
     recordingStartTime = nil
     if stopSound then
@@ -553,52 +787,20 @@ function stopDictation(autoEnter, stopSound)
     startLoadingSound()
     isTranscribing = true
 
-    transcribeTask = hs.task.new("/bin/bash", function(code, out, err)
-        local result = ""
-        local rf = io.open("/tmp/dictation.result", "r")
-        if rf then
-            result = rf:read("*a"):gsub("^%s+", ""):gsub("%s+$", "")
-            rf:close()
-            os.remove("/tmp/dictation.result")
-        end
+    pendingFinalize = { autoEnter = autoEnter }
+    if recPipelineTask and recPipelineTask:isRunning() then
+        recPipelineTask:terminate()  -- bash script's trap flushes ffmpeg's last chunk
+    else
+        -- Defensive: pipeline already exited. Trigger finalisation directly.
+        recPipelineDone = true
+        processNextChunk()
+    end
+end
 
-        if result ~= "" then
-            -- Smart paste: check if user is still in the original window
-            local currentWindow = hs.window.focusedWindow()
-            local sameWindow = (currentWindow and targetWindow
-                                and currentWindow:id() == targetWindow:id())
-
-            if sameWindow then
-                -- Same window → paste immediately (original behaviour)
-                hs.timer.doAfter(0.15, function()
-                    hs.eventtap.keyStroke({"cmd"}, "v")
-                    if autoEnter then
-                        hs.timer.doAfter(0.05, function()
-                            hs.eventtap.keyStroke({}, "return")
-                        end)
-                    end
-                    targetWindow = nil
-                    targetApp    = nil
-                end)
-                isTranscribing = false
-                transcribeTask = nil
-                escHotkey:stop()
-                showResult(result)
-            else
-                -- Different window → enter pending state
-                -- Keep escHotkey running so ESC can dismiss pending
-                isTranscribing = false
-                transcribeTask = nil
-                showPending(result)
-                startPendingState(result, autoEnter)
-            end
-        else
-            isTranscribing = false
-            transcribeTask = nil
-            escHotkey:stop()
-            showResult(nil)
-        end
-    end, { dictateScript, "stop-transcribe-only" }):start()
+local function cleanupChunks()
+    if chunkWatcher then chunkWatcher:stop(); chunkWatcher = nil end
+    -- Wipe the whole chunk dir; never leave audio fragments around.
+    hs.execute(string.format("rm -rf %q", CHUNK_DIR))
 end
 
 local function cancelDictation()
@@ -608,25 +810,33 @@ local function cancelDictation()
     escHotkey:stop()
     enterHotkey:disable()
     shiftHotkey:stop()
-    if recTask and recTask:isRunning() then recTask:terminate() end
-    recTask = nil
+    cancelRequested = true
+    pendingFinalize = nil
+    if recPipelineTask and recPipelineTask:isRunning() then recPipelineTask:terminate() end
+    if pendingEnrichTask and pendingEnrichTask:isRunning() then pendingEnrichTask:terminate() end
+    if activeChunkTask and activeChunkTask:isRunning() then activeChunkTask:terminate() end
+    activeChunkTask    = nil
+    pendingEnrichTask  = nil
     stopWaveAnimation()
     playSoundFile("question-004.mp3", 0.7)
     hidePill()
-    os.remove("/tmp/dictation.wav")
+    cleanupChunks()
 end
 
 local function cancelTranscription()
     if not isTranscribing then return end
     isTranscribing = false
-    if transcribeTask and transcribeTask:isRunning() then transcribeTask:terminate() end
-    transcribeTask = nil
+    cancelRequested = true
+    pendingFinalize = nil
+    if recPipelineTask and recPipelineTask:isRunning() then recPipelineTask:terminate() end
+    if pendingEnrichTask and pendingEnrichTask:isRunning() then pendingEnrichTask:terminate() end
+    if activeChunkTask and activeChunkTask:isRunning() then activeChunkTask:terminate() end
+    activeChunkTask    = nil
+    pendingEnrichTask  = nil
     stopLoadingSound()
     playSoundFile("question-004.mp3", 0.7)
     hidePill()
-    os.remove("/tmp/dictation.wav")
-    os.remove("/tmp/dictation.result")
-    os.remove("/tmp/dictation.txt")
+    cleanupChunks()
     targetWindow = nil
     targetApp = nil
 end

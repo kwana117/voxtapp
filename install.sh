@@ -4,17 +4,22 @@ set -euo pipefail
 echo "=== Instalação: Whisper.cpp Dictation (macOS Apple Silicon) ==="
 
 # 1. Dependências via Homebrew
-echo "[1/6] A instalar dependências (sox, hammerspoon)..."
+echo "[1/6] A instalar dependências (sox, ffmpeg, hammerspoon)..."
 brew install sox
+brew install ffmpeg
 brew install --cask hammerspoon
 
-# 2. Hammerspoon config + sons
-echo "[2/6] A instalar config do Hammerspoon e sons..."
+# 2. Hammerspoon config + sons + scripts
+echo "[2/6] A instalar config do Hammerspoon, sons e scripts..."
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 mkdir -p "$HOME/.hammerspoon/sounds"
+mkdir -p "$HOME/scripts"
 cp "$REPO_DIR/hammerspoon-init.lua" "$HOME/.hammerspoon/init.lua"
 cp "$REPO_DIR/sounds/"*.mp3 "$HOME/.hammerspoon/sounds/"
-echo "✓ Config e sons copiados para ~/.hammerspoon/"
+cp "$REPO_DIR/dictate.sh" "$HOME/scripts/dictate.sh"
+cp "$REPO_DIR/record-chunks.sh" "$HOME/scripts/record-chunks.sh"
+chmod +x "$HOME/scripts/dictate.sh" "$HOME/scripts/record-chunks.sh"
+echo "✓ Config, sons e scripts copiados (~/.hammerspoon/, ~/scripts/)"
 
 # 3. Clonar whisper.cpp
 WHISPER_DIR="$HOME/whisper.cpp"
