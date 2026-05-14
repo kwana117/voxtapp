@@ -35,21 +35,45 @@ WHISPER_FLAGS=(
     -sns
     -tp 0.0
     -nf
+    # -mc 0: do NOT carry decoder context across VAD segments. Without this,
+    # short recordings split by VAD produce repeat hallucinations
+    # ("Alô 1 2 3 4 5 6. Alô 1 2 3 4 5 6.") because the decoder re-emits the
+    # previous segment's tokens when it sees similar acoustic features.
+    -mc 0
 )
 
-# Post-filter: phrases that whisper-large-v3 emits on silence/music/noise even
-# with VAD on. Stripped from final text. Anchored to whole-utterance matches.
+# Post-filter: strips whisper-large-v3 ghost phrases and collapses consecutive
+# duplicate sentences. Whisper emits same-sentence repeats on short or
+# ambiguous audio regardless of beam/temperature/VAD flags — needs a textual
+# dedupe pass to be reliable.
 strip_hallucinations() {
-    # Reads stdin, writes filtered stdout. Each pattern is a Perl regex.
-    perl -CSDA -pe '
-        s/\bObrigad[oa]s? por (?:verem|assistirem|terem assistido)[^.!?\n]*[.!?]?//gi;
-        s/\bLegendas?(?:\s+(?:e\s+)?revis[ãa]o)?\s+(?:feitas?\s+)?por[^.!?\n]*[.!?]?//gi;
-        s/\bSubtitles?\s+(?:by|provided\s+by)[^.!?\n]*[.!?]?//gi;
-        s/\bThanks?\s+for\s+watching[^.!?\n]*[.!?]?//gi;
-        s/\bSubscribe(?:\s+to[^.!?\n]+)?[.!?]?//gi;
-        s/\bAmara\.org[^.!?\n]*//gi;
-        s/\s+/ /g;
-        s/^\s+|\s+$//g;
+    perl -CSDA -e '
+        local $/; my $t = <STDIN>;
+        # 1. Strip well-known ghost phrases.
+        $t =~ s/\bObrigad[oa]s? por (?:verem|assistirem|terem assistido)[^.!?\n]*[.!?]?//gi;
+        $t =~ s/\bLegendas?(?:\s+(?:e\s+)?revis[ãa]o)?\s+(?:feitas?\s+)?por[^.!?\n]*[.!?]?//gi;
+        $t =~ s/\bSubtitles?\s+(?:by|provided\s+by)[^.!?\n]*[.!?]?//gi;
+        $t =~ s/\bThanks?\s+for\s+watching[^.!?\n]*[.!?]?//gi;
+        $t =~ s/\bSubscribe(?:\s+to[^.!?\n]+)?[.!?]?//gi;
+        $t =~ s/\bAmara\.org[^.!?\n]*//gi;
+        # 2. Collapse consecutive identical sentences ("Alô 1 2 3. Alô 1 2 3.").
+        # Split on sentence terminators while keeping them; dedupe via a
+        # case- and whitespace-insensitive normalized form.
+        my @parts = split /(?<=[.!?])\s+/, $t;
+        my @out;
+        my $prev = "";
+        for my $s (@parts) {
+            (my $norm = lc $s) =~ s/\s+/ /g;
+            $norm =~ s/^\s+|\s+$//g;
+            $norm =~ s/[.!?,;:]+$//;
+            next if $norm eq "";
+            if ($norm ne $prev) { push @out, $s; $prev = $norm; }
+        }
+        $t = join(" ", @out);
+        # 3. Final whitespace cleanup.
+        $t =~ s/\s+/ /g;
+        $t =~ s/^\s+|\s+$//g;
+        print $t;
     '
 }
 

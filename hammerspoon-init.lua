@@ -1124,14 +1124,16 @@ local function checkDefaultInput()
     end
 end
 
-local audioWatcher = hs.audiodevice.watcher.new(function(event)
-    -- Trim trailing spaces in event names ("dIn ", "sIn ").
+-- hs.audiodevice.watcher is a singleton (setCallback + start), not an
+-- instance factory — there is no .new() in this Hammerspoon version.
+hs.audiodevice.watcher.setCallback(function(event)
+    -- Event names from CoreAudio are 4-char codes, often padded with spaces.
     local e = (event or ""):gsub("%s+$", "")
     if e == "dIn" or e == "sIn" or e == "dev#" then
         checkDefaultInput()
     end
 end)
-audioWatcher:start()
+hs.audiodevice.watcher.start()
 
 -- One-shot check on load: if the user reloads Hammerspoon while the input is
 -- already mismatched, surface that immediately.
