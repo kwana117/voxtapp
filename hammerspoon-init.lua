@@ -3,7 +3,8 @@
 -- Floating macOS pill via hs.webview
 -- ============================================
 
-local dictateScript = os.getenv("HOME") .. "/scripts/dictate.sh"
+local dictateScript        = os.getenv("HOME") .. "/scripts/dictate.sh"
+local recordChunksScript   = os.getenv("HOME") .. "/scripts/record-chunks.sh"
 
 -- ============================================
 -- Configuração
@@ -11,7 +12,6 @@ local dictateScript = os.getenv("HOME") .. "/scripts/dictate.sh"
 local AUTO_ENTER = true
 local isRecording = false
 local pillView = nil
-local recTask = nil
 local escHotkey = nil
 local enterHotkey = nil
 local shiftHotkey = nil
@@ -27,8 +27,73 @@ local waveValues = {8, 12, 16, 12, 8}
 local waveEnergy = 0.3
 local recordingStartTime = nil       -- timestamp when recording started
 local isTranscribing = false          -- true while whisper is running
-local transcribeTask = nil            -- hs.task for dictate.sh (so ESC can kill it)
 local MIN_RECORD_SECS = 1.5          -- ignore Enter/Shift before this
+
+-- ============================================
+-- Chunked recording / transcription
+-- ============================================
+-- Strategy: ffmpeg's segment muxer rotates files every CHUNK_SECS seconds
+-- without dropping samples. As soon as a chunk finalises, we kick off whisper
+-- on it (sequentially, one at a time, to avoid CPU contention). Each chunk is
+-- enriched with the trailing OVERLAP_SECS of the previous chunk so a word
+-- split across a boundary appears intact in the next transcription. The
+-- downstream consumer (an LLM) handles the resulting word duplications.
+local CHUNK_DIR     = "/tmp/voxt-chunks"
+local CHUNK_SECS    = 18
+local OVERLAP_SECS  = 3
+local RAW_TAP       = CHUNK_DIR .. "/_raw.pcm"   -- live raw-PCM tap for mic monitor
+
+-- ============================================
+-- Health: pre-flight + live mic-energy monitor
+-- ============================================
+-- Pre-flight: a fast SSH probe to the Mac Mini (whisper-cli + VAD model must
+-- exist). Runs on every hotkey press BEFORE rec starts, so a dead transcriber
+-- is caught instantly instead of after a 2-minute monologue.
+local REMOTE_HOST            = "macmini"
+local REMOTE_WHISPER         = "/opt/homebrew/bin/whisper-cli"
+local REMOTE_MODEL           = "/Users/zion/whisper.cpp/models/ggml-large-v3.bin"
+local REMOTE_VAD_MODEL       = "/Users/zion/whisper.cpp/models/ggml-silero-v5.1.2.bin"
+local PREFLIGHT_TIMEOUT_SECS = 3
+-- Voxtapp ALWAYS records from this device by name, regardless of the macOS
+-- default input. Prevents silent recordings when another app (meeting
+-- assistant, OBS, Loopback) sets the system default to an aggregate device.
+-- record-chunks.sh reads VOXT_INPUT_DEVICE; keep these two in sync.
+local INPUT_DEVICE_NAME      = "MacBook Pro Microphone"
+
+-- Mic monitor: while recording, sample the tail of /tmp/voxt-chunks/_raw.pcm
+-- every MIC_CHECK_INTERVAL seconds (after a short grace period). If RMS stays
+-- below MIC_SILENCE_THRESHOLD for MIC_SILENCE_STREAK consecutive samples, flip
+-- the pill into a "no audio" warning state — without stopping the recording,
+-- so the user can fix the mic mid-dictation.
+-- Tuned to catch a dead/quiet mic within ~3.5s. The user's earlier failed
+-- recording was 4.35s of near-silence (RMS 0.001) — with the previous 7s
+-- detection window, the warning had no chance to fire.
+local MIC_CHECK_GRACE        = 1.2    -- secs before first check (lets buffers fill)
+local MIC_CHECK_INTERVAL     = 0.8    -- secs between checks
+local MIC_TAIL_BYTES         = 16000  -- ~0.5s of 16-bit mono 16kHz audio
+-- 0.02 chosen empirically: real PT speech sits at RMS 0.05–0.2; quiet input
+-- (low mic gain, AirPods at arm's length) lands around 0.01 and produces
+-- "(no text detected)" from whisper.
+local MIC_SILENCE_THRESHOLD  = 0.02
+local MIC_SILENCE_STREAK     = 3      -- ~3.6s below threshold before warning
+
+local micCheckTimer          = nil
+local micSilenceCount        = 0
+local micWarningShown        = false
+local micWarningSeen         = false  -- sticky: set when silence detected during this take
+local preflightTask          = nil
+
+local recPipelineTask    = nil   -- hs.task for record-chunks.sh
+local recPipelineDone    = false -- true once recording bash script has exited
+local chunkWatcher       = nil   -- hs.pathwatcher on CHUNK_DIR
+local seenChunks         = {}    -- map: idx → true (chunk file has appeared)
+local finalisedChunks    = {}    -- map: idx → true (file fully written + closed)
+local transcribedChunks  = {}    -- map: idx → text
+local chunkQueue         = {}    -- ordered list of indices waiting for whisper
+local activeChunkTask    = nil   -- hs.task running whisper on a chunk
+local pendingEnrichTask  = nil   -- hs.task running sox to build enriched chunk
+local pendingFinalize    = nil   -- nil | { autoEnter = bool }
+local cancelRequested    = false
 
 -- Smart paste: pending state when user switched windows
 local pendingResult = nil             -- transcribed text waiting to be pasted
@@ -496,13 +561,353 @@ local function hidePill()
     movePillOffScreen()
 end
 
--- ============================================
--- Dictation control
--- ============================================
-local function startDictation()
-    if isRecording then return end
-    isRecording = true
+local function showError(msg)
+    stopLoadingSound()
+    stopWaveAnimation()
+    playSoundFile("question-004.mp3", 0.7)
+    updatePill({
+        text  = "\xe2\x9a\xa0 " .. msg,
+        bg    = "rgba(60, 18, 18, 0.92)",
+        color = "rgba(255, 140, 140, 0.95)",
+    })
+    if dismissTimer then dismissTimer:stop() end
+    dismissTimer = hs.timer.doAfter(4.5, function()
+        movePillOffScreen()
+        dismissTimer = nil
+    end)
+end
 
+-- Soft warning shown DURING recording when the mic is dead silent.
+-- Keeps recording active so the user can recover (e.g., unmute, fix device)
+-- and reverts to normal "Recording…" state once audio energy returns.
+local function showMicWarning()
+    updatePill({
+        text     = "\xe2\x9a\xa0 Sem \xc3\xa1udio \xe2\x80\x94 verifica o microfone",
+        bg       = "rgba(60, 36, 12, 0.92)",
+        color    = "rgba(255, 200, 100, 0.95)",
+        showWave = true,
+        badge    = "ESC Cancel",
+    })
+end
+
+-- Passive alert when the macOS default input changes to something other than
+-- the device voxtapp is pinned to. Voxtapp records correctly regardless (it
+-- pins by name), but the user benefits from knowing the system default no
+-- longer matches — e.g., a meeting app just hijacked it.
+local function showInputMismatchAlert(currentName)
+    -- Don't interrupt an active recording/transcription/pending state.
+    if isRecording or isTranscribing or pendingResult then return end
+    local label = currentName or "?"
+    if #label > 24 then label = label:sub(1, 21) .. "..." end
+    ensurePill(function()
+        updatePill({
+            text  = "\xe2\x9a\xa0 Input: " .. label,
+            bg    = "rgba(60, 36, 12, 0.92)",
+            color = "rgba(255, 200, 100, 0.95)",
+            badge = "voxt usa " .. INPUT_DEVICE_NAME,
+        })
+        if dismissTimer then dismissTimer:stop() end
+        dismissTimer = hs.timer.doAfter(4.5, function()
+            -- Don't hide if a recording started in the meantime.
+            if not isRecording and not isTranscribing and not pendingResult then
+                movePillOffScreen()
+            end
+            dismissTimer = nil
+        end)
+    end)
+end
+
+-- ============================================
+-- Health checks: pre-flight + live mic-energy monitor
+-- ============================================
+local function runPreflight(onOK, onFail)
+    -- Local check first (instant): the pinned input device must exist on the
+    -- system. If the user unplugged a USB mic or the device name changed,
+    -- bail with a specific error instead of recording silence.
+    if not hs.audiodevice.findInputByName(INPUT_DEVICE_NAME) then
+        onFail("Mic n\xc3\xa3o encontrado: " .. INPUT_DEVICE_NAME)
+        return
+    end
+
+    -- Remote check: whisper-cli + model files must exist on the Mac Mini.
+    -- ControlMaster keeps the connection warm so this is ~50ms in steady state.
+    -- ConnectTimeout caps cold-cache cases at 3s.
+    local cmd = string.format(
+        [[/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=%d %s ]] ..
+        [['test -x %s && test -f %s && test -f %s && echo ok' 2>/dev/null]],
+        PREFLIGHT_TIMEOUT_SECS, REMOTE_HOST,
+        REMOTE_WHISPER, REMOTE_MODEL, REMOTE_VAD_MODEL
+    )
+    preflightTask = hs.task.new("/bin/bash", function(code, out, _err)
+        preflightTask = nil
+        local ok = (code == 0) and (out and out:find("ok"))
+        if ok then onOK() else onFail("Mac Mini offline \xe2\x80\x94 transcri\xc3\xa7\xc3\xa3o indispon\xc3\xadvel") end
+    end, { "-c", cmd })
+    preflightTask:start()
+end
+
+-- Reads tail of the raw PCM tap and computes RMS via sox.
+-- Calls done(rms) with rms as a number (0.0–1.0 range); rms is nil if the tap
+-- is missing or sox failed.
+local function sampleMicRMS(done)
+    if not hs.fs.attributes(RAW_TAP) then done(nil); return end
+    local cmd = string.format(
+        [[/usr/bin/tail -c %d %q 2>/dev/null | ]] ..
+        [[/opt/homebrew/bin/sox -t raw -r 16000 -c 1 -b 16 -e signed - -n stat 2>&1 | ]] ..
+        [[/usr/bin/awk '/RMS .*amplitude/ {print $NF; exit}']],
+        MIC_TAIL_BYTES, RAW_TAP
+    )
+    hs.task.new("/bin/bash", function(_code, out, _err)
+        local rms = tonumber((out or ""):gsub("%s+", ""))
+        done(rms)
+    end, { "-c", cmd }):start()
+end
+
+local function stopMicMonitor()
+    if micCheckTimer then micCheckTimer:stop(); micCheckTimer = nil end
+    micSilenceCount = 0
+    micWarningShown = false
+end
+
+local function startMicMonitor()
+    stopMicMonitor()
+    micWarningSeen = false
+    hs.timer.doAfter(MIC_CHECK_GRACE, function()
+        if not isRecording then return end
+        micCheckTimer = hs.timer.doEvery(MIC_CHECK_INTERVAL, function()
+            if not isRecording then stopMicMonitor(); return end
+            sampleMicRMS(function(rms)
+                if not isRecording then return end
+                if rms == nil then return end  -- tap not ready yet
+                if rms < MIC_SILENCE_THRESHOLD then
+                    micSilenceCount = micSilenceCount + 1
+                    if micSilenceCount >= MIC_SILENCE_STREAK and not micWarningShown then
+                        micWarningShown = true
+                        micWarningSeen = true
+                        showMicWarning()
+                    end
+                else
+                    -- Audio came back: clear warning and resume normal recording UI.
+                    if micWarningShown then
+                        micWarningShown = false
+                        showRecording()
+                    end
+                    micSilenceCount = 0
+                end
+            end)
+        end)
+    end)
+end
+
+-- ============================================
+-- Dictation control (chunked pipeline)
+-- ============================================
+
+local function chunkPath(idx)
+    return string.format("%s/chunk_%03d.wav", CHUNK_DIR, idx)
+end
+
+local function enrichedPath(idx)
+    return string.format("%s/_enriched_%03d.wav", CHUNK_DIR, idx)
+end
+
+local function chunkOutBase(idx)
+    return string.format("%s/chunk_%03d", CHUNK_DIR, idx)
+end
+
+local function listChunkIndices()
+    local idxs = {}
+    if not hs.fs.attributes(CHUNK_DIR, "mode") then return idxs end
+    for f in hs.fs.dir(CHUNK_DIR) do
+        local n = f:match("^chunk_(%d+)%.wav$")
+        if n then table.insert(idxs, tonumber(n)) end
+    end
+    table.sort(idxs)
+    return idxs
+end
+
+local function resetChunkState()
+    chunkQueue        = {}
+    seenChunks        = {}
+    finalisedChunks   = {}
+    transcribedChunks = {}
+    pendingFinalize   = nil
+    cancelRequested   = false
+    recPipelineDone   = false
+end
+
+-- Forward-declared because of mutual recursion via callbacks.
+local processNextChunk
+local maybeFinalize
+
+local function transcribeChunkAt(idx, done)
+    local current = chunkPath(idx)
+    if not hs.fs.attributes(current) then
+        transcribedChunks[idx] = ""
+        done()
+        return
+    end
+
+    local function runWhisper(input)
+        local outBase = chunkOutBase(idx)
+        os.remove(outBase .. ".txt")
+        activeChunkTask = hs.task.new("/bin/bash", function(_code, _out, _err)
+            activeChunkTask = nil
+            local txt = ""
+            local rf = io.open(outBase .. ".txt", "r")
+            if rf then
+                txt = rf:read("*a"):gsub("^%s+", ""):gsub("%s+$", "")
+                rf:close()
+            end
+            if txt == "[BLANK_AUDIO]" then txt = "" end
+            transcribedChunks[idx] = txt
+            os.remove(enrichedPath(idx))
+            done()
+        end, { dictateScript, "transcribe-chunk", input, outBase })
+        activeChunkTask:start()
+    end
+
+    -- For idx 0 there is no previous chunk → no overlap.
+    if idx == 0 then
+        runWhisper(current)
+        return
+    end
+
+    local prev = chunkPath(idx - 1)
+    if not hs.fs.attributes(prev) then
+        runWhisper(current)
+        return
+    end
+
+    -- Build enriched chunk = last OVERLAP_SECS of prev + all of current.
+    -- Run via /bin/bash so we can pipe sox commands.
+    local enriched = enrichedPath(idx)
+    local tailFile = string.format("%s/_tail_%03d.wav", CHUNK_DIR, idx)
+    local cmd = string.format(
+        "/opt/homebrew/bin/sox %q %q trim -%d 2>/dev/null && " ..
+        "/opt/homebrew/bin/sox %q %q %q 2>/dev/null; " ..
+        "rm -f %q",
+        prev, tailFile, OVERLAP_SECS,
+        tailFile, current, enriched,
+        tailFile
+    )
+    pendingEnrichTask = hs.task.new("/bin/bash", function(_code, _out, _err)
+        pendingEnrichTask = nil
+        if hs.fs.attributes(enriched) then
+            runWhisper(enriched)
+        else
+            -- Enrichment failed: transcribe plain chunk so we never lose audio.
+            runWhisper(current)
+        end
+    end, { "-c", cmd })
+    pendingEnrichTask:start()
+end
+
+processNextChunk = function()
+    if cancelRequested then return end
+    if activeChunkTask or pendingEnrichTask then return end
+    if #chunkQueue == 0 then
+        maybeFinalize()
+        return
+    end
+    local idx = table.remove(chunkQueue, 1)
+    transcribeChunkAt(idx, function() processNextChunk() end)
+end
+
+local function enqueueChunk(idx)
+    if finalisedChunks[idx] then return end
+    finalisedChunks[idx] = true
+    table.insert(chunkQueue, idx)
+    table.sort(chunkQueue)
+    processNextChunk()
+end
+
+maybeFinalize = function()
+    if cancelRequested then return end
+    if not recPipelineDone then return end
+    if not pendingFinalize then return end
+    if activeChunkTask or pendingEnrichTask then return end
+    if #chunkQueue > 0 then return end
+
+    -- Assemble full transcription in chunk order (with intentional overlap
+    -- duplications — downstream LLM dedupes naturally).
+    local indices = listChunkIndices()
+    local parts = {}
+    for _, idx in ipairs(indices) do
+        local txt = transcribedChunks[idx]
+        if txt and txt ~= "" then
+            table.insert(parts, txt)
+        end
+    end
+    local result = table.concat(parts, " ")
+        :gsub("%s+", " ")
+        :gsub("^%s+", "")
+        :gsub("%s+$", "")
+
+    local autoEnter = pendingFinalize.autoEnter
+    pendingFinalize = nil
+
+    if chunkWatcher then chunkWatcher:stop(); chunkWatcher = nil end
+
+    if result ~= "" then
+        hs.pasteboard.setContents(result)
+        local currentWindow = hs.window.focusedWindow()
+        local sameWindow = (currentWindow and targetWindow
+                            and currentWindow:id() == targetWindow:id())
+        if sameWindow then
+            hs.timer.doAfter(0.15, function()
+                hs.eventtap.keyStroke({"cmd"}, "v")
+                if autoEnter then
+                    hs.timer.doAfter(0.05, function()
+                        hs.eventtap.keyStroke({}, "return")
+                    end)
+                end
+                targetWindow = nil
+                targetApp    = nil
+            end)
+            isTranscribing = false
+            escHotkey:stop()
+            showResult(result)
+        else
+            isTranscribing = false
+            showPending(result)
+            startPendingState(result, autoEnter)
+        end
+    else
+        isTranscribing = false
+        escHotkey:stop()
+        showResult(nil)
+    end
+end
+
+local function onChunkDirChange(_paths, _flags)
+    -- ffmpeg's segment muxer only opens chunk_(N+1).wav after closing chunk_N.
+    -- So the appearance of chunk_(N+1) is the signal that chunk_N is final.
+    local idxs = listChunkIndices()
+    for _, idx in ipairs(idxs) do
+        if not seenChunks[idx] then
+            seenChunks[idx] = true
+            if idx > 0 then
+                enqueueChunk(idx - 1)
+            end
+        end
+    end
+end
+
+local function onRecPipelineExit(_code, _out, _err)
+    recPipelineTask = nil
+    -- The bash script's cleanup trap waits for ffmpeg to flush the last chunk
+    -- before exiting. So when we get here, the highest-indexed chunk file is
+    -- final too. Mark it for transcription.
+    local idxs = listChunkIndices()
+    if #idxs > 0 then
+        enqueueChunk(idxs[#idxs])
+    end
+    recPipelineDone = true
+    processNextChunk()
+end
+
+local function beginRecording()
     -- Guardar janela ativa AGORA (antes de qualquer mudança de foco)
     targetWindow = hs.window.focusedWindow()
     targetApp    = hs.application.frontmostApplication()
@@ -513,16 +918,56 @@ local function startDictation()
 
     if dismissTimer then dismissTimer:stop(); dismissTimer = nil end
     recordingStartTime = hs.timer.secondsSinceEpoch()
+    resetChunkState()
     playSoundFile("confirmation-001.mp3", 0.8)
     ensurePill(function()
         showRecording()
         startWaveAnimation()
     end)
 
-    recTask = hs.task.new("/opt/homebrew/bin/rec", function() end, {
-        "-r", "16000", "-c", "1", "-b", "16", "/tmp/dictation.wav",
+    hs.execute(string.format("mkdir -p %q", CHUNK_DIR))
+    -- pathwatcher must attach AFTER the dir exists.
+    chunkWatcher = hs.pathwatcher.new(CHUNK_DIR, onChunkDirChange):start()
+
+    recPipelineTask = hs.task.new(
+        "/bin/bash",
+        onRecPipelineExit,
+        { recordChunksScript, CHUNK_DIR, tostring(CHUNK_SECS) }
+    )
+    recPipelineTask:setEnvironment({
+        PATH = "/opt/homebrew/bin:/usr/bin:/bin",
+        VOXT_INPUT_DEVICE = INPUT_DEVICE_NAME,
+        LANG = "en_US.UTF-8",
+        LC_ALL = "en_US.UTF-8",
     })
-    recTask:start()
+    recPipelineTask:start()
+    startMicMonitor()
+end
+
+local function startDictation()
+    if isRecording then return end
+    isRecording = true
+
+    -- Show an instant "checking" state so the user gets visual feedback while
+    -- the pre-flight SSH probe runs. Pill stays up regardless of outcome.
+    ensurePill(function()
+        updatePill({
+            text  = "Checking\xe2\x80\xa6",
+            bg    = "rgba(24, 26, 40, 0.82)",
+            color = "rgba(180, 200, 255, 0.92)",
+        })
+    end)
+
+    runPreflight(
+        function()  -- onOK
+            if not isRecording then return end  -- user already cancelled
+            beginRecording()
+        end,
+        function(msg)  -- onFail
+            isRecording = false
+            showError(msg or "Pre-flight failed")
+        end
+    )
 end
 
 local function hasMinRecordingTime()
@@ -539,10 +984,8 @@ function stopDictation(autoEnter, stopSound)
     enterHotkey:disable()
     shiftHotkey:stop()
 
-    if recTask and recTask:isRunning() then recTask:terminate() end
-    recTask = nil
-
     stopWaveAnimation()
+    stopMicMonitor()
     recordingStartTime = nil
     if stopSound then
         playSoundFile(stopSound, 0.8)
@@ -553,52 +996,20 @@ function stopDictation(autoEnter, stopSound)
     startLoadingSound()
     isTranscribing = true
 
-    transcribeTask = hs.task.new("/bin/bash", function(code, out, err)
-        local result = ""
-        local rf = io.open("/tmp/dictation.result", "r")
-        if rf then
-            result = rf:read("*a"):gsub("^%s+", ""):gsub("%s+$", "")
-            rf:close()
-            os.remove("/tmp/dictation.result")
-        end
+    pendingFinalize = { autoEnter = autoEnter }
+    if recPipelineTask and recPipelineTask:isRunning() then
+        recPipelineTask:terminate()  -- bash script's trap flushes ffmpeg's last chunk
+    else
+        -- Defensive: pipeline already exited. Trigger finalisation directly.
+        recPipelineDone = true
+        processNextChunk()
+    end
+end
 
-        if result ~= "" then
-            -- Smart paste: check if user is still in the original window
-            local currentWindow = hs.window.focusedWindow()
-            local sameWindow = (currentWindow and targetWindow
-                                and currentWindow:id() == targetWindow:id())
-
-            if sameWindow then
-                -- Same window → paste immediately (original behaviour)
-                hs.timer.doAfter(0.15, function()
-                    hs.eventtap.keyStroke({"cmd"}, "v")
-                    if autoEnter then
-                        hs.timer.doAfter(0.05, function()
-                            hs.eventtap.keyStroke({}, "return")
-                        end)
-                    end
-                    targetWindow = nil
-                    targetApp    = nil
-                end)
-                isTranscribing = false
-                transcribeTask = nil
-                escHotkey:stop()
-                showResult(result)
-            else
-                -- Different window → enter pending state
-                -- Keep escHotkey running so ESC can dismiss pending
-                isTranscribing = false
-                transcribeTask = nil
-                showPending(result)
-                startPendingState(result, autoEnter)
-            end
-        else
-            isTranscribing = false
-            transcribeTask = nil
-            escHotkey:stop()
-            showResult(nil)
-        end
-    end, { dictateScript, "stop-transcribe-only" }):start()
+local function cleanupChunks()
+    if chunkWatcher then chunkWatcher:stop(); chunkWatcher = nil end
+    -- Wipe the whole chunk dir; never leave audio fragments around.
+    hs.execute(string.format("rm -rf %q", CHUNK_DIR))
 end
 
 local function cancelDictation()
@@ -608,25 +1019,34 @@ local function cancelDictation()
     escHotkey:stop()
     enterHotkey:disable()
     shiftHotkey:stop()
-    if recTask and recTask:isRunning() then recTask:terminate() end
-    recTask = nil
+    cancelRequested = true
+    pendingFinalize = nil
+    if recPipelineTask and recPipelineTask:isRunning() then recPipelineTask:terminate() end
+    if pendingEnrichTask and pendingEnrichTask:isRunning() then pendingEnrichTask:terminate() end
+    if activeChunkTask and activeChunkTask:isRunning() then activeChunkTask:terminate() end
+    activeChunkTask    = nil
+    pendingEnrichTask  = nil
     stopWaveAnimation()
+    stopMicMonitor()
     playSoundFile("question-004.mp3", 0.7)
     hidePill()
-    os.remove("/tmp/dictation.wav")
+    cleanupChunks()
 end
 
 local function cancelTranscription()
     if not isTranscribing then return end
     isTranscribing = false
-    if transcribeTask and transcribeTask:isRunning() then transcribeTask:terminate() end
-    transcribeTask = nil
+    cancelRequested = true
+    pendingFinalize = nil
+    if recPipelineTask and recPipelineTask:isRunning() then recPipelineTask:terminate() end
+    if pendingEnrichTask and pendingEnrichTask:isRunning() then pendingEnrichTask:terminate() end
+    if activeChunkTask and activeChunkTask:isRunning() then activeChunkTask:terminate() end
+    activeChunkTask    = nil
+    pendingEnrichTask  = nil
     stopLoadingSound()
     playSoundFile("question-004.mp3", 0.7)
     hidePill()
-    os.remove("/tmp/dictation.wav")
-    os.remove("/tmp/dictation.result")
-    os.remove("/tmp/dictation.txt")
+    cleanupChunks()
     targetWindow = nil
     targetApp = nil
 end
@@ -690,6 +1110,34 @@ shiftHotkey = hs.eventtap.new({hs.eventtap.event.types.flagsChanged}, function(e
 end)
 
 require("hs.ipc")
+
+-- ============================================
+-- Default-input watcher
+-- ============================================
+-- macOS fires the watcher on EVERY device change (input, output, system in/out,
+-- device list). We only care when the *default input* is no longer pinned.
+local function checkDefaultInput()
+    local cur = hs.audiodevice.defaultInputDevice()
+    if not cur then return end
+    if cur:name() ~= INPUT_DEVICE_NAME then
+        showInputMismatchAlert(cur:name())
+    end
+end
+
+-- hs.audiodevice.watcher is a singleton (setCallback + start), not an
+-- instance factory — there is no .new() in this Hammerspoon version.
+hs.audiodevice.watcher.setCallback(function(event)
+    -- Event names from CoreAudio are 4-char codes, often padded with spaces.
+    local e = (event or ""):gsub("%s+$", "")
+    if e == "dIn" or e == "sIn" or e == "dev#" then
+        checkDefaultInput()
+    end
+end)
+hs.audiodevice.watcher.start()
+
+-- One-shot check on load: if the user reloads Hammerspoon while the input is
+-- already mismatched, surface that immediately.
+hs.timer.doAfter(1.5, checkDefaultInput)
 
 -- Pré-aquecer o webview no startup para evitar atraso na primeira gravação.
 -- Cria-se directamente OFF_SCREEN para nunca aparecer no top-center antes de :hide(),
