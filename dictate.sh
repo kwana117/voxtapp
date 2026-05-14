@@ -8,23 +8,50 @@ export LANG="en_US.UTF-8"
 export LC_ALL="en_US.UTF-8"
 
 # === Configuração ===
-WHISPER_DIR="$HOME/whisper.cpp"
-MODEL="$WHISPER_DIR/models/ggml-large-v3.bin"
+# Transcrição corre no Mac Mini M4 via SSH (alias "macmini" em ~/.ssh/config com
+# ControlMaster). O MacBook deixou de ter whisper.cpp local.
+REMOTE_HOST="macmini"
+REMOTE_WHISPER="/opt/homebrew/bin/whisper-cli"
+REMOTE_MODEL="/Users/zion/whisper.cpp/models/ggml-large-v3.bin"
+REMOTE_VAD_MODEL="/Users/zion/whisper.cpp/models/ggml-silero-v5.1.2.bin"
+REMOTE_TMP="/tmp"
 AUDIO_FILE="/tmp/dictation.wav"
 TRANSCRIPT_FILE="/tmp/dictation.txt"
+THREADS=8  # Mac Mini M4 tem mais cores que o MacBook
 
-# Detectar binário (nome mudou entre versões)
-if [ -f "$WHISPER_DIR/build/bin/whisper-cli" ]; then
-    WHISPER_BIN="$WHISPER_DIR/build/bin/whisper-cli"
-elif [ -f "$WHISPER_DIR/build/bin/main" ]; then
-    WHISPER_BIN="$WHISPER_DIR/build/bin/main"
-else
-    echo "Erro: binário whisper não encontrado" >&2
-    exit 1
-fi
+# Anti-hallucination whisper flags:
+#   --vad + Silero VAD model → skips silent regions (the #1 cause of hallucinated
+#     "Obrigado por verem"/"Subscribe"/etc. on quiet chunks).
+#   -sns (suppress non-speech tokens), -tp 0.0 (deterministic), -nf (no temp
+#     fallback — reject low-confidence segments instead of guessing).
+WHISPER_FLAGS=(
+    -t "$THREADS"
+    -l auto
+    --no-timestamps
+    -otxt
+    --vad
+    --vad-model "$REMOTE_VAD_MODEL"
+    -vt 0.35
+    -sns
+    -tp 0.0
+    -nf
+)
 
-# Threads para M1 (4 performance cores)
-THREADS=4
+# Post-filter: phrases that whisper-large-v3 emits on silence/music/noise even
+# with VAD on. Stripped from final text. Anchored to whole-utterance matches.
+strip_hallucinations() {
+    # Reads stdin, writes filtered stdout. Each pattern is a Perl regex.
+    perl -CSDA -pe '
+        s/\bObrigad[oa]s? por (?:verem|assistirem|terem assistido)[^.!?\n]*[.!?]?//gi;
+        s/\bLegendas?(?:\s+(?:e\s+)?revis[ãa]o)?\s+(?:feitas?\s+)?por[^.!?\n]*[.!?]?//gi;
+        s/\bSubtitles?\s+(?:by|provided\s+by)[^.!?\n]*[.!?]?//gi;
+        s/\bThanks?\s+for\s+watching[^.!?\n]*[.!?]?//gi;
+        s/\bSubscribe(?:\s+to[^.!?\n]+)?[.!?]?//gi;
+        s/\bAmara\.org[^.!?\n]*//gi;
+        s/\s+/ /g;
+        s/^\s+|\s+$//g;
+    '
+}
 
 # === Funções ===
 start_recording() {
@@ -85,20 +112,21 @@ transcribe() {
 
     echo "transcribing" > /tmp/dictation.state
 
-    # Transcrever — language=auto detecta PT/EN automaticamente
-    "$WHISPER_BIN" \
-        -m "$MODEL" \
-        -f "$AUDIO_FILE" \
-        -t "$THREADS" \
-        -l auto \
-        --no-timestamps \
-        -otxt \
-        -of /tmp/dictation \
-        2>/dev/null
+    # Transcrever no Mac Mini via SSH. Pipe áudio por stdin, capturamos texto por stdout.
+    REMOTE_BASENAME="voxt_dictation_$$"
+    cat "$AUDIO_FILE" | ssh -o BatchMode=yes "$REMOTE_HOST" "
+        set -e
+        cat > $REMOTE_TMP/$REMOTE_BASENAME.wav
+        $REMOTE_WHISPER -m $REMOTE_MODEL -f $REMOTE_TMP/$REMOTE_BASENAME.wav \
+            ${WHISPER_FLAGS[*]} \
+            -of $REMOTE_TMP/$REMOTE_BASENAME 2>/dev/null
+        cat $REMOTE_TMP/$REMOTE_BASENAME.txt 2>/dev/null || true
+        rm -f $REMOTE_TMP/$REMOTE_BASENAME.wav $REMOTE_TMP/$REMOTE_BASENAME.txt
+    " > "$TRANSCRIPT_FILE" 2>/dev/null
 
-    # Ler texto, limpar espaços extra
+    # Ler texto, limpar espaços extra, remover frases-fantasma do whisper.
     if [ -f "$TRANSCRIPT_FILE" ]; then
-        TEXT=$(cat "$TRANSCRIPT_FILE" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | tr '\n' ' ' | sed 's/  */ /g')
+        TEXT=$(cat "$TRANSCRIPT_FILE" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | tr '\n' ' ' | sed 's/  */ /g' | strip_hallucinations)
 
         if [ -n "$TEXT" ] && [ "$TEXT" != "[BLANK_AUDIO]" ]; then
             # Guardar resultado para Hammerspoon ler
@@ -165,15 +193,17 @@ case "${1:-}" in
             prev_size=$curr_size
             sleep 0.05
         done
-        "$WHISPER_BIN" \
-            -m "$MODEL" \
-            -f "$INPUT_FILE" \
-            -t "$THREADS" \
-            -l auto \
-            --no-timestamps \
-            -otxt \
-            -of "$OUT_BASE" \
-            2>/dev/null
+        # Transcrição corre no Mac Mini. Pipe da chunk via stdin, recebe texto via stdout.
+        REMOTE_BASENAME="voxt_$(basename "$OUT_BASE")_$$"
+        cat "$INPUT_FILE" | ssh -o BatchMode=yes "$REMOTE_HOST" "
+            set -e
+            cat > $REMOTE_TMP/$REMOTE_BASENAME.wav
+            $REMOTE_WHISPER -m $REMOTE_MODEL -f $REMOTE_TMP/$REMOTE_BASENAME.wav \
+                ${WHISPER_FLAGS[*]} \
+                -of $REMOTE_TMP/$REMOTE_BASENAME 2>/dev/null
+            cat $REMOTE_TMP/$REMOTE_BASENAME.txt 2>/dev/null || true
+            rm -f $REMOTE_TMP/$REMOTE_BASENAME.wav $REMOTE_TMP/$REMOTE_BASENAME.txt
+        " 2>/dev/null | strip_hallucinations > "$OUT_BASE.txt"
         ;;
     *)
         echo "Uso: $0 {start|stop|cancel|stop-transcribe-only|transcribe-chunk <input> <out_base>}"

@@ -41,6 +41,35 @@ local MIN_RECORD_SECS = 1.5          -- ignore Enter/Shift before this
 local CHUNK_DIR     = "/tmp/voxt-chunks"
 local CHUNK_SECS    = 18
 local OVERLAP_SECS  = 3
+local RAW_TAP       = CHUNK_DIR .. "/_raw.pcm"   -- live raw-PCM tap for mic monitor
+
+-- ============================================
+-- Health: pre-flight + live mic-energy monitor
+-- ============================================
+-- Pre-flight: a fast SSH probe to the Mac Mini (whisper-cli + VAD model must
+-- exist). Runs on every hotkey press BEFORE rec starts, so a dead transcriber
+-- is caught instantly instead of after a 2-minute monologue.
+local REMOTE_HOST            = "macmini"
+local REMOTE_WHISPER         = "/opt/homebrew/bin/whisper-cli"
+local REMOTE_MODEL           = "/Users/zion/whisper.cpp/models/ggml-large-v3.bin"
+local REMOTE_VAD_MODEL       = "/Users/zion/whisper.cpp/models/ggml-silero-v5.1.2.bin"
+local PREFLIGHT_TIMEOUT_SECS = 3
+
+-- Mic monitor: while recording, sample the tail of /tmp/voxt-chunks/_raw.pcm
+-- every MIC_CHECK_INTERVAL seconds (after a short grace period). If RMS stays
+-- below MIC_SILENCE_THRESHOLD for MIC_SILENCE_STREAK consecutive samples, flip
+-- the pill into a "no audio" warning state — without stopping the recording,
+-- so the user can fix the mic mid-dictation.
+local MIC_CHECK_GRACE        = 2.5    -- secs before first check (lets buffers fill)
+local MIC_CHECK_INTERVAL     = 1.5    -- secs between checks
+local MIC_TAIL_BYTES         = 32000  -- ~1s of 16-bit mono 16kHz audio
+local MIC_SILENCE_THRESHOLD  = 0.005  -- sox RMS amplitude considered silence
+local MIC_SILENCE_STREAK     = 3      -- ~4.5s of silence before warning fires
+
+local micCheckTimer          = nil
+local micSilenceCount        = 0
+local micWarningShown        = false
+local preflightTask          = nil
 
 local recPipelineTask    = nil   -- hs.task for record-chunks.sh
 local recPipelineDone    = false -- true once recording bash script has exited
@@ -520,6 +549,107 @@ local function hidePill()
     movePillOffScreen()
 end
 
+local function showError(msg)
+    stopLoadingSound()
+    stopWaveAnimation()
+    playSoundFile("question-004.mp3", 0.7)
+    updatePill({
+        text  = "\xe2\x9a\xa0 " .. msg,
+        bg    = "rgba(60, 18, 18, 0.92)",
+        color = "rgba(255, 140, 140, 0.95)",
+    })
+    if dismissTimer then dismissTimer:stop() end
+    dismissTimer = hs.timer.doAfter(4.5, function()
+        movePillOffScreen()
+        dismissTimer = nil
+    end)
+end
+
+-- Soft warning shown DURING recording when the mic is dead silent.
+-- Keeps recording active so the user can recover (e.g., unmute, fix device)
+-- and reverts to normal "Recording…" state once audio energy returns.
+local function showMicWarning()
+    updatePill({
+        text     = "\xe2\x9a\xa0 Sem \xc3\xa1udio \xe2\x80\x94 verifica o microfone",
+        bg       = "rgba(60, 36, 12, 0.92)",
+        color    = "rgba(255, 200, 100, 0.95)",
+        showWave = true,
+        badge    = "ESC Cancel",
+    })
+end
+
+-- ============================================
+-- Health checks: pre-flight + live mic-energy monitor
+-- ============================================
+local function runPreflight(onOK, onFail)
+    -- Single SSH call: verify whisper-cli + model files exist on the Mac Mini.
+    -- ControlMaster keeps the connection warm so this is ~50ms in steady state.
+    -- ConnectTimeout caps cold-cache cases at 3s.
+    local cmd = string.format(
+        [[/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=%d %s ]] ..
+        [['test -x %s && test -f %s && test -f %s && echo ok' 2>/dev/null]],
+        PREFLIGHT_TIMEOUT_SECS, REMOTE_HOST,
+        REMOTE_WHISPER, REMOTE_MODEL, REMOTE_VAD_MODEL
+    )
+    preflightTask = hs.task.new("/bin/bash", function(code, out, _err)
+        preflightTask = nil
+        local ok = (code == 0) and (out and out:find("ok"))
+        if ok then onOK() else onFail() end
+    end, { "-c", cmd })
+    preflightTask:start()
+end
+
+-- Reads tail of the raw PCM tap and computes RMS via sox.
+-- Calls done(rms) with rms as a number (0.0–1.0 range); rms is nil if the tap
+-- is missing or sox failed.
+local function sampleMicRMS(done)
+    if not hs.fs.attributes(RAW_TAP) then done(nil); return end
+    local cmd = string.format(
+        [[/usr/bin/tail -c %d %q 2>/dev/null | ]] ..
+        [[/opt/homebrew/bin/sox -t raw -r 16000 -c 1 -b 16 -e signed - -n stat 2>&1 | ]] ..
+        [[/usr/bin/awk '/RMS .*amplitude/ {print $NF; exit}']],
+        MIC_TAIL_BYTES, RAW_TAP
+    )
+    hs.task.new("/bin/bash", function(_code, out, _err)
+        local rms = tonumber((out or ""):gsub("%s+", ""))
+        done(rms)
+    end, { "-c", cmd }):start()
+end
+
+local function stopMicMonitor()
+    if micCheckTimer then micCheckTimer:stop(); micCheckTimer = nil end
+    micSilenceCount = 0
+    micWarningShown = false
+end
+
+local function startMicMonitor()
+    stopMicMonitor()
+    hs.timer.doAfter(MIC_CHECK_GRACE, function()
+        if not isRecording then return end
+        micCheckTimer = hs.timer.doEvery(MIC_CHECK_INTERVAL, function()
+            if not isRecording then stopMicMonitor(); return end
+            sampleMicRMS(function(rms)
+                if not isRecording then return end
+                if rms == nil then return end  -- tap not ready yet
+                if rms < MIC_SILENCE_THRESHOLD then
+                    micSilenceCount = micSilenceCount + 1
+                    if micSilenceCount >= MIC_SILENCE_STREAK and not micWarningShown then
+                        micWarningShown = true
+                        showMicWarning()
+                    end
+                else
+                    -- Audio came back: clear warning and resume normal recording UI.
+                    if micWarningShown then
+                        micWarningShown = false
+                        showRecording()
+                    end
+                    micSilenceCount = 0
+                end
+            end)
+        end)
+    end)
+end
+
 -- ============================================
 -- Dictation control (chunked pipeline)
 -- ============================================
@@ -538,9 +668,8 @@ end
 
 local function listChunkIndices()
     local idxs = {}
-    local iter = hs.fs.dir(CHUNK_DIR)
-    if not iter then return idxs end
-    for f in iter do
+    if not hs.fs.attributes(CHUNK_DIR, "mode") then return idxs end
+    for f in hs.fs.dir(CHUNK_DIR) do
         local n = f:match("^chunk_(%d+)%.wav$")
         if n then table.insert(idxs, tonumber(n)) end
     end
@@ -729,10 +858,7 @@ local function onRecPipelineExit(_code, _out, _err)
     processNextChunk()
 end
 
-local function startDictation()
-    if isRecording then return end
-    isRecording = true
-
+local function beginRecording()
     -- Guardar janela ativa AGORA (antes de qualquer mudança de foco)
     targetWindow = hs.window.focusedWindow()
     targetApp    = hs.application.frontmostApplication()
@@ -760,6 +886,33 @@ local function startDictation()
         { recordChunksScript, CHUNK_DIR, tostring(CHUNK_SECS) }
     )
     recPipelineTask:start()
+    startMicMonitor()
+end
+
+local function startDictation()
+    if isRecording then return end
+    isRecording = true
+
+    -- Show an instant "checking" state so the user gets visual feedback while
+    -- the pre-flight SSH probe runs. Pill stays up regardless of outcome.
+    ensurePill(function()
+        updatePill({
+            text  = "Checking\xe2\x80\xa6",
+            bg    = "rgba(24, 26, 40, 0.82)",
+            color = "rgba(180, 200, 255, 0.92)",
+        })
+    end)
+
+    runPreflight(
+        function()  -- onOK
+            if not isRecording then return end  -- user already cancelled
+            beginRecording()
+        end,
+        function()  -- onFail
+            isRecording = false
+            showError("Mac Mini offline \xe2\x80\x94 transcri\xc3\xa7\xc3\xa3o indispon\xc3\xadvel")
+        end
+    )
 end
 
 local function hasMinRecordingTime()
@@ -777,6 +930,7 @@ function stopDictation(autoEnter, stopSound)
     shiftHotkey:stop()
 
     stopWaveAnimation()
+    stopMicMonitor()
     recordingStartTime = nil
     if stopSound then
         playSoundFile(stopSound, 0.8)
@@ -818,6 +972,7 @@ local function cancelDictation()
     activeChunkTask    = nil
     pendingEnrichTask  = nil
     stopWaveAnimation()
+    stopMicMonitor()
     playSoundFile("question-004.mp3", 0.7)
     hidePill()
     cleanupChunks()

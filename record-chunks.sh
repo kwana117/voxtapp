@@ -2,9 +2,12 @@
 # Records audio and writes timed WAV segments to a chunk dir.
 # Hammerspoon sends SIGTERM to stop; the trap finalises the last chunk cleanly.
 #
-# Pipeline: rec → FIFO → ffmpeg segment muxer
+# Pipeline: rec → tee → FIFO → ffmpeg segment muxer
+#                     ↘ _raw.pcm (live tap for mic-energy health check)
 # Using raw PCM through the FIFO avoids the streaming-WAV header issue that
-# caused the original "missing tail" bug.
+# caused the original "missing tail" bug. The _raw.pcm tap lets Hammerspoon
+# detect a dead mic within seconds (e.g., wrong input device, muted hardware)
+# without waiting for the first chunk to close.
 
 set -euo pipefail
 
@@ -20,9 +23,12 @@ rm -rf "$CHUNK_DIR"
 mkdir -p "$CHUNK_DIR"
 
 FIFO="$CHUNK_DIR/_audio.fifo"
+TEE_IN="$CHUNK_DIR/_tee_in.fifo"
+RAW_COPY="$CHUNK_DIR/_raw.pcm"
 mkfifo "$FIFO"
+mkfifo "$TEE_IN"
 
-# Start ffmpeg first (consumer), then rec (producer).
+# Start ffmpeg first (consumer of FIFO), then tee (splitter), then rec (producer).
 # - segment_time: target chunk length in seconds
 # - reset_timestamps: each segment starts at 0 (whisper-friendly)
 # - pcm_s16le: same format as input — zero-cost passthrough
@@ -33,21 +39,26 @@ ffmpeg -hide_banner -loglevel error \
     "$CHUNK_DIR/chunk_%03d.wav" &
 FFMPEG_PID=$!
 
-rec -q -r 16000 -c 1 -b 16 -t raw - 2>/dev/null > "$FIFO" &
+# tee splits raw PCM: $RAW_COPY for live mic-energy check, $FIFO for ffmpeg.
+tee "$RAW_COPY" < "$TEE_IN" > "$FIFO" &
+TEE_PID=$!
+
+rec -q -r 16000 -c 1 -b 16 -t raw - 2>/dev/null > "$TEE_IN" &
 REC_PID=$!
 
 cleanup() {
-    # Kill rec → FIFO closes → ffmpeg gets EOF and finalises the last segment.
+    # Kill rec → tee gets EOF → FIFO closes → ffmpeg flushes last segment.
     if kill -0 "$REC_PID" 2>/dev/null; then
         kill -TERM "$REC_PID" 2>/dev/null || true
     fi
-    # Wait for ffmpeg to flush the last segment before exiting.
+    wait "$TEE_PID" 2>/dev/null || true
     wait "$FFMPEG_PID" 2>/dev/null || true
-    rm -f "$FIFO"
+    rm -f "$FIFO" "$TEE_IN" "$RAW_COPY"
 }
 trap cleanup EXIT INT TERM
 
 # Wait for rec; if Hammerspoon kills us, the trap handles the rest.
 wait "$REC_PID" 2>/dev/null || true
+wait "$TEE_PID" 2>/dev/null || true
 wait "$FFMPEG_PID" 2>/dev/null || true
-rm -f "$FIFO"
+rm -f "$FIFO" "$TEE_IN" "$RAW_COPY"
