@@ -193,9 +193,21 @@ case "${1:-}" in
             prev_size=$curr_size
             sleep 0.05
         done
+        # Peak-normalize quiet chunks to -3 dBFS before whisper. Without this,
+        # a quiet mic (low input gain, AirPods at distance, etc.) produces
+        # audio whisper-large-v3 silently drops as "no speech", and the user
+        # sees "(no text detected)" with no clue why. The gain stage gives
+        # whisper a fighting chance; the VAD downstream still filters
+        # actual silence/noise so we don't amplify junk into hallucinations.
+        SEND_FILE="$INPUT_FILE"
+        MAX_AMP=$(/opt/homebrew/bin/sox "$INPUT_FILE" -n stat 2>&1 | awk '/Maximum amplitude/ {print $NF}')
+        if awk "BEGIN {exit !(${MAX_AMP:-0} > 0.005 && ${MAX_AMP:-0} < 0.5)}"; then
+            NORM_FILE="${INPUT_FILE%.wav}_norm.wav"
+            /opt/homebrew/bin/sox "$INPUT_FILE" "$NORM_FILE" gain -n -3 2>/dev/null && SEND_FILE="$NORM_FILE"
+        fi
         # Transcrição corre no Mac Mini. Pipe da chunk via stdin, recebe texto via stdout.
         REMOTE_BASENAME="voxt_$(basename "$OUT_BASE")_$$"
-        cat "$INPUT_FILE" | ssh -o BatchMode=yes "$REMOTE_HOST" "
+        cat "$SEND_FILE" | ssh -o BatchMode=yes "$REMOTE_HOST" "
             set -e
             cat > $REMOTE_TMP/$REMOTE_BASENAME.wav
             $REMOTE_WHISPER -m $REMOTE_MODEL -f $REMOTE_TMP/$REMOTE_BASENAME.wav \
@@ -204,6 +216,7 @@ case "${1:-}" in
             cat $REMOTE_TMP/$REMOTE_BASENAME.txt 2>/dev/null || true
             rm -f $REMOTE_TMP/$REMOTE_BASENAME.wav $REMOTE_TMP/$REMOTE_BASENAME.txt
         " 2>/dev/null | strip_hallucinations > "$OUT_BASE.txt"
+        [ -n "${NORM_FILE:-}" ] && [ -f "$NORM_FILE" ] && rm -f "$NORM_FILE"
         ;;
     *)
         echo "Uso: $0 {start|stop|cancel|stop-transcribe-only|transcribe-chunk <input> <out_base>}"

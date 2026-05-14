@@ -54,21 +54,33 @@ local REMOTE_WHISPER         = "/opt/homebrew/bin/whisper-cli"
 local REMOTE_MODEL           = "/Users/zion/whisper.cpp/models/ggml-large-v3.bin"
 local REMOTE_VAD_MODEL       = "/Users/zion/whisper.cpp/models/ggml-silero-v5.1.2.bin"
 local PREFLIGHT_TIMEOUT_SECS = 3
+-- Voxtapp ALWAYS records from this device by name, regardless of the macOS
+-- default input. Prevents silent recordings when another app (meeting
+-- assistant, OBS, Loopback) sets the system default to an aggregate device.
+-- record-chunks.sh reads VOXT_INPUT_DEVICE; keep these two in sync.
+local INPUT_DEVICE_NAME      = "MacBook Pro Microphone"
 
 -- Mic monitor: while recording, sample the tail of /tmp/voxt-chunks/_raw.pcm
 -- every MIC_CHECK_INTERVAL seconds (after a short grace period). If RMS stays
 -- below MIC_SILENCE_THRESHOLD for MIC_SILENCE_STREAK consecutive samples, flip
 -- the pill into a "no audio" warning state — without stopping the recording,
 -- so the user can fix the mic mid-dictation.
-local MIC_CHECK_GRACE        = 2.5    -- secs before first check (lets buffers fill)
-local MIC_CHECK_INTERVAL     = 1.5    -- secs between checks
-local MIC_TAIL_BYTES         = 32000  -- ~1s of 16-bit mono 16kHz audio
-local MIC_SILENCE_THRESHOLD  = 0.005  -- sox RMS amplitude considered silence
-local MIC_SILENCE_STREAK     = 3      -- ~4.5s of silence before warning fires
+-- Tuned to catch a dead/quiet mic within ~3.5s. The user's earlier failed
+-- recording was 4.35s of near-silence (RMS 0.001) — with the previous 7s
+-- detection window, the warning had no chance to fire.
+local MIC_CHECK_GRACE        = 1.2    -- secs before first check (lets buffers fill)
+local MIC_CHECK_INTERVAL     = 0.8    -- secs between checks
+local MIC_TAIL_BYTES         = 16000  -- ~0.5s of 16-bit mono 16kHz audio
+-- 0.02 chosen empirically: real PT speech sits at RMS 0.05–0.2; quiet input
+-- (low mic gain, AirPods at arm's length) lands around 0.01 and produces
+-- "(no text detected)" from whisper.
+local MIC_SILENCE_THRESHOLD  = 0.02
+local MIC_SILENCE_STREAK     = 3      -- ~3.6s below threshold before warning
 
 local micCheckTimer          = nil
 local micSilenceCount        = 0
 local micWarningShown        = false
+local micWarningSeen         = false  -- sticky: set when silence detected during this take
 local preflightTask          = nil
 
 local recPipelineTask    = nil   -- hs.task for record-chunks.sh
@@ -582,7 +594,15 @@ end
 -- Health checks: pre-flight + live mic-energy monitor
 -- ============================================
 local function runPreflight(onOK, onFail)
-    -- Single SSH call: verify whisper-cli + model files exist on the Mac Mini.
+    -- Local check first (instant): the pinned input device must exist on the
+    -- system. If the user unplugged a USB mic or the device name changed,
+    -- bail with a specific error instead of recording silence.
+    if not hs.audiodevice.findInputByName(INPUT_DEVICE_NAME) then
+        onFail("Mic n\xc3\xa3o encontrado: " .. INPUT_DEVICE_NAME)
+        return
+    end
+
+    -- Remote check: whisper-cli + model files must exist on the Mac Mini.
     -- ControlMaster keeps the connection warm so this is ~50ms in steady state.
     -- ConnectTimeout caps cold-cache cases at 3s.
     local cmd = string.format(
@@ -594,7 +614,7 @@ local function runPreflight(onOK, onFail)
     preflightTask = hs.task.new("/bin/bash", function(code, out, _err)
         preflightTask = nil
         local ok = (code == 0) and (out and out:find("ok"))
-        if ok then onOK() else onFail() end
+        if ok then onOK() else onFail("Mac Mini offline \xe2\x80\x94 transcri\xc3\xa7\xc3\xa3o indispon\xc3\xadvel") end
     end, { "-c", cmd })
     preflightTask:start()
 end
@@ -624,6 +644,7 @@ end
 
 local function startMicMonitor()
     stopMicMonitor()
+    micWarningSeen = false
     hs.timer.doAfter(MIC_CHECK_GRACE, function()
         if not isRecording then return end
         micCheckTimer = hs.timer.doEvery(MIC_CHECK_INTERVAL, function()
@@ -635,6 +656,7 @@ local function startMicMonitor()
                     micSilenceCount = micSilenceCount + 1
                     if micSilenceCount >= MIC_SILENCE_STREAK and not micWarningShown then
                         micWarningShown = true
+                        micWarningSeen = true
                         showMicWarning()
                     end
                 else
@@ -885,6 +907,12 @@ local function beginRecording()
         onRecPipelineExit,
         { recordChunksScript, CHUNK_DIR, tostring(CHUNK_SECS) }
     )
+    recPipelineTask:setEnvironment({
+        PATH = "/opt/homebrew/bin:/usr/bin:/bin",
+        VOXT_INPUT_DEVICE = INPUT_DEVICE_NAME,
+        LANG = "en_US.UTF-8",
+        LC_ALL = "en_US.UTF-8",
+    })
     recPipelineTask:start()
     startMicMonitor()
 end
@@ -908,9 +936,9 @@ local function startDictation()
             if not isRecording then return end  -- user already cancelled
             beginRecording()
         end,
-        function()  -- onFail
+        function(msg)  -- onFail
             isRecording = false
-            showError("Mac Mini offline \xe2\x80\x94 transcri\xc3\xa7\xc3\xa3o indispon\xc3\xadvel")
+            showError(msg or "Pre-flight failed")
         end
     )
 end
