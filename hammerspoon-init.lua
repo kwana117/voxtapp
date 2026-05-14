@@ -590,6 +590,33 @@ local function showMicWarning()
     })
 end
 
+-- Passive alert when the macOS default input changes to something other than
+-- the device voxtapp is pinned to. Voxtapp records correctly regardless (it
+-- pins by name), but the user benefits from knowing the system default no
+-- longer matches — e.g., a meeting app just hijacked it.
+local function showInputMismatchAlert(currentName)
+    -- Don't interrupt an active recording/transcription/pending state.
+    if isRecording or isTranscribing or pendingResult then return end
+    local label = currentName or "?"
+    if #label > 24 then label = label:sub(1, 21) .. "..." end
+    ensurePill(function()
+        updatePill({
+            text  = "\xe2\x9a\xa0 Input: " .. label,
+            bg    = "rgba(60, 36, 12, 0.92)",
+            color = "rgba(255, 200, 100, 0.95)",
+            badge = "voxt usa " .. INPUT_DEVICE_NAME,
+        })
+        if dismissTimer then dismissTimer:stop() end
+        dismissTimer = hs.timer.doAfter(4.5, function()
+            -- Don't hide if a recording started in the meantime.
+            if not isRecording and not isTranscribing and not pendingResult then
+                movePillOffScreen()
+            end
+            dismissTimer = nil
+        end)
+    end)
+end
+
 -- ============================================
 -- Health checks: pre-flight + live mic-energy monitor
 -- ============================================
@@ -1083,6 +1110,32 @@ shiftHotkey = hs.eventtap.new({hs.eventtap.event.types.flagsChanged}, function(e
 end)
 
 require("hs.ipc")
+
+-- ============================================
+-- Default-input watcher
+-- ============================================
+-- macOS fires the watcher on EVERY device change (input, output, system in/out,
+-- device list). We only care when the *default input* is no longer pinned.
+local function checkDefaultInput()
+    local cur = hs.audiodevice.defaultInputDevice()
+    if not cur then return end
+    if cur:name() ~= INPUT_DEVICE_NAME then
+        showInputMismatchAlert(cur:name())
+    end
+end
+
+local audioWatcher = hs.audiodevice.watcher.new(function(event)
+    -- Trim trailing spaces in event names ("dIn ", "sIn ").
+    local e = (event or ""):gsub("%s+$", "")
+    if e == "dIn" or e == "sIn" or e == "dev#" then
+        checkDefaultInput()
+    end
+end)
+audioWatcher:start()
+
+-- One-shot check on load: if the user reloads Hammerspoon while the input is
+-- already mismatched, surface that immediately.
+hs.timer.doAfter(1.5, checkDefaultInput)
 
 -- Pré-aquecer o webview no startup para evitar atraso na primeira gravação.
 -- Cria-se directamente OFF_SCREEN para nunca aparecer no top-center antes de :hide(),
