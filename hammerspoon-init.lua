@@ -748,59 +748,42 @@ local function transcribeChunkAt(idx, done)
         return
     end
 
-    local function runWhisper(input)
-        local outBase = chunkOutBase(idx)
-        os.remove(outBase .. ".txt")
-        activeChunkTask = hs.task.new("/bin/bash", function(_code, _out, _err)
-            activeChunkTask = nil
-            local txt = ""
-            local rf = io.open(outBase .. ".txt", "r")
-            if rf then
-                txt = rf:read("*a"):gsub("^%s+", ""):gsub("%s+$", "")
-                rf:close()
-            end
-            if txt == "[BLANK_AUDIO]" then txt = "" end
-            transcribedChunks[idx] = txt
-            os.remove(enrichedPath(idx))
-            done()
-        end, { dictateScript, "transcribe-chunk", input, outBase })
-        activeChunkTask:start()
-    end
-
-    -- For idx 0 there is no previous chunk → no overlap.
-    if idx == 0 then
-        runWhisper(current)
-        return
-    end
-
-    local prev = chunkPath(idx - 1)
-    if not hs.fs.attributes(prev) then
-        runWhisper(current)
-        return
-    end
-
-    -- Build enriched chunk = last OVERLAP_SECS of prev + all of current.
-    -- Run via /bin/bash so we can pipe sox commands.
-    local enriched = enrichedPath(idx)
-    local tailFile = string.format("%s/_tail_%03d.wav", CHUNK_DIR, idx)
-    local cmd = string.format(
-        "/opt/homebrew/bin/sox %q %q trim -%d 2>/dev/null && " ..
-        "/opt/homebrew/bin/sox %q %q %q 2>/dev/null; " ..
-        "rm -f %q",
-        prev, tailFile, OVERLAP_SECS,
-        tailFile, current, enriched,
-        tailFile
-    )
-    pendingEnrichTask = hs.task.new("/bin/bash", function(_code, _out, _err)
-        pendingEnrichTask = nil
-        if hs.fs.attributes(enriched) then
-            runWhisper(enriched)
-        else
-            -- Enrichment failed: transcribe plain chunk so we never lose audio.
-            runWhisper(current)
+    -- Build a text prompt from the last N words of the previous chunk's transcript.
+    -- Whisper uses this for boundary continuity without re-transcribing audio,
+    -- which was the root cause of hallucination loops (audio prepend caused the
+    -- model to loop on the prepended context before moving to new content).
+    local PROMPT_WORDS = 40
+    local promptText = nil
+    if idx > 0 then
+        local prevTxt = transcribedChunks[idx - 1] or ""
+        if prevTxt ~= "" then
+            local words = {}
+            for w in prevTxt:gmatch("%S+") do table.insert(words, w) end
+            local start = math.max(1, #words - PROMPT_WORDS + 1)
+            local slice = {}
+            for i = start, #words do table.insert(slice, words[i]) end
+            promptText = table.concat(slice, " ")
         end
-    end, { "-c", cmd })
-    pendingEnrichTask:start()
+    end
+
+    local outBase = chunkOutBase(idx)
+    os.remove(outBase .. ".txt")
+    local args = { dictateScript, "transcribe-chunk", current, outBase }
+    if promptText then table.insert(args, promptText) end
+
+    activeChunkTask = hs.task.new("/bin/bash", function(_code, _out, _err)
+        activeChunkTask = nil
+        local txt = ""
+        local rf = io.open(outBase .. ".txt", "r")
+        if rf then
+            txt = rf:read("*a"):gsub("^%s+", ""):gsub("%s+$", "")
+            rf:close()
+        end
+        if txt == "[BLANK_AUDIO]" then txt = "" end
+        transcribedChunks[idx] = txt
+        done()
+    end, args)
+    activeChunkTask:start()
 end
 
 processNextChunk = function()
