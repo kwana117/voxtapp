@@ -144,7 +144,7 @@ VOXT_LOCAL_THREADS=4
 
 ### Transcribing on a remote Mac (optional)
 
-If you have a second, faster Mac on your network reachable over passwordless SSH, `dictate.sh` can send audio there for transcription instead of running whisper.cpp on this machine. Create `~/.voxtapp.env`:
+If you have a second, faster Mac on your network reachable over passwordless SSH, `dictate.sh` (and the Hammerspoon pre-flight check) can send audio there for transcription instead of running whisper.cpp on this machine. Create `~/.voxtapp.env`:
 
 ```bash
 VOXT_REMOTE_HOST="my-other-mac"          # SSH host/alias, must not prompt for a password
@@ -155,14 +155,15 @@ VOXT_REMOTE_TMP="/tmp"
 VOXT_REMOTE_THREADS=8
 ```
 
-The remote Mac needs whisper.cpp compiled and both models present (run `install.sh` there too, or copy `~/whisper.cpp` over). Without this file, or without `VOXT_REMOTE_HOST` set, transcription always runs locally.
+The remote Mac needs whisper.cpp compiled and both models present (run `install.sh` there too, or copy `~/whisper.cpp` over). Without this file, or without `VOXT_REMOTE_HOST` set, both the pre-flight check and transcription always run locally — this is the default, so a fresh clone works standalone on a single machine with no extra setup.
 
 ## Troubleshooting
 
 | Symptom | Fix |
 |---|---|
 | Nothing happens on shortcut | Check Hammerspoon has Accessibility permission |
-| "whisper-cli não encontrado" | Re-run `install.sh`; check `~/whisper.cpp/build/bin/` |
+| "whisper.cpp não instalado — corre ./install.sh" | Re-run `install.sh`; check `~/whisper.cpp/build/bin/` and `~/whisper.cpp/models/` |
+| "Mac remoto offline" | Only shown if you configured `VOXT_REMOTE_HOST` in `~/.voxtapp.env` — check SSH access to that host, or remove the file to fall back to local |
 | Microphone not recording | Check Microphone permission for Hammerspoon in System Settings |
 | Very slow transcription | Ensure Metal is enabled; check `~/whisper.cpp/build/bin/whisper-cli --help` |
 | Text pasted to wrong window | Click your target window before pressing ⌥⌘L |

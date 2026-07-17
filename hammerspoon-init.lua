@@ -46,14 +46,32 @@ local RAW_TAP       = CHUNK_DIR .. "/_raw.pcm"   -- live raw-PCM tap for mic mon
 -- ============================================
 -- Health: pre-flight + live mic-energy monitor
 -- ============================================
--- Pre-flight: a fast SSH probe to the Mac Mini (whisper-cli + VAD model must
--- exist). Runs on every hotkey press BEFORE rec starts, so a dead transcriber
--- is caught instantly instead of after a 2-minute monologue.
-local REMOTE_HOST            = "macmini"
-local REMOTE_WHISPER         = "/opt/homebrew/bin/whisper-cli"
-local REMOTE_MODEL           = "/Users/zion/whisper.cpp/models/ggml-large-v3.bin"
-local REMOTE_VAD_MODEL       = "/Users/zion/whisper.cpp/models/ggml-silero-v5.1.2.bin"
+-- Pre-flight: verify a transcriber is reachable BEFORE rec starts, so a dead
+-- transcriber is caught instantly instead of after a 2-minute monologue.
+--
+-- Local by default: checks whisper-cli + models exist under ~/whisper.cpp
+-- (installed by install.sh) — no network call needed. To use a faster
+-- remote Mac instead (SSH probe), create ~/.voxtapp.env with at least
+-- VOXT_REMOTE_HOST set — same file dictate.sh reads, see README.
+local function loadVoxtEnv()
+    local env = {}
+    local f = io.open(os.getenv("HOME") .. "/.voxtapp.env", "r")
+    if not f then return env end
+    for line in f:lines() do
+        local key, val = line:match('^%s*(VOXT_[%w_]+)%s*=%s*"?([^"]-)"?%s*$')
+        if key then env[key] = val end
+    end
+    f:close()
+    return env
+end
+
+local voxtEnv                = loadVoxtEnv()
+local REMOTE_HOST            = voxtEnv.VOXT_REMOTE_HOST
+local REMOTE_WHISPER         = voxtEnv.VOXT_REMOTE_WHISPER or "/opt/homebrew/bin/whisper-cli"
+local REMOTE_MODEL           = voxtEnv.VOXT_REMOTE_MODEL
+local REMOTE_VAD_MODEL       = voxtEnv.VOXT_REMOTE_VAD_MODEL
 local PREFLIGHT_TIMEOUT_SECS = 3
+local LOCAL_WHISPER_DIR      = os.getenv("HOME") .. "/whisper.cpp"
 -- Voxtapp ALWAYS records from this device by name, regardless of the macOS
 -- default input. Prevents silent recordings when another app (meeting
 -- assistant, OBS, Loopback) sets the system default to an aggregate device.
@@ -629,21 +647,36 @@ local function runPreflight(onOK, onFail)
         return
     end
 
-    -- Remote check: whisper-cli + model files must exist on the Mac Mini.
-    -- ControlMaster keeps the connection warm so this is ~50ms in steady state.
-    -- ConnectTimeout caps cold-cache cases at 3s.
-    local cmd = string.format(
-        [[/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=%d %s ]] ..
-        [['test -x %s && test -f %s && test -f %s && echo ok' 2>/dev/null]],
-        PREFLIGHT_TIMEOUT_SECS, REMOTE_HOST,
-        REMOTE_WHISPER, REMOTE_MODEL, REMOTE_VAD_MODEL
-    )
-    preflightTask = hs.task.new("/bin/bash", function(code, out, _err)
-        preflightTask = nil
-        local ok = (code == 0) and (out and out:find("ok"))
-        if ok then onOK() else onFail("Mac Mini offline \xe2\x80\x94 transcri\xc3\xa7\xc3\xa3o indispon\xc3\xadvel") end
-    end, { "-c", cmd })
-    preflightTask:start()
+    if REMOTE_HOST and REMOTE_HOST ~= "" then
+        -- Remote check: whisper-cli + model files must exist on the remote Mac.
+        -- ControlMaster keeps the connection warm so this is ~50ms in steady
+        -- state. ConnectTimeout caps cold-cache cases at 3s.
+        local cmd = string.format(
+            [[/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=%d %s ]] ..
+            [['test -x %s && test -f %s && test -f %s && echo ok' 2>/dev/null]],
+            PREFLIGHT_TIMEOUT_SECS, REMOTE_HOST,
+            REMOTE_WHISPER, REMOTE_MODEL, REMOTE_VAD_MODEL
+        )
+        preflightTask = hs.task.new("/bin/bash", function(code, out, _err)
+            preflightTask = nil
+            local ok = (code == 0) and (out and out:find("ok"))
+            if ok then onOK() else onFail("Mac remoto offline \xe2\x80\x94 transcri\xc3\xa7\xc3\xa3o indispon\xc3\xadvel") end
+        end, { "-c", cmd })
+        preflightTask:start()
+        return
+    end
+
+    -- Local check (instant, no network): whisper-cli + models must exist
+    -- under ~/whisper.cpp, same layout install.sh produces.
+    local binOK = hs.fs.attributes(LOCAL_WHISPER_DIR .. "/build/bin/whisper-cli")
+        or hs.fs.attributes(LOCAL_WHISPER_DIR .. "/build/bin/main")
+    local modelOK = hs.fs.attributes(LOCAL_WHISPER_DIR .. "/models/ggml-large-v3.bin")
+    local vadOK = hs.fs.attributes(LOCAL_WHISPER_DIR .. "/models/ggml-silero-v5.1.2.bin")
+    if binOK and modelOK and vadOK then
+        onOK()
+    else
+        onFail("whisper.cpp n\xc3\xa3o instalado \xe2\x80\x94 corre ./install.sh")
+    end
 end
 
 -- Reads tail of the raw PCM tap and computes RMS via sox.
