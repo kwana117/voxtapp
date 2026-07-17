@@ -8,39 +8,76 @@ export LANG="en_US.UTF-8"
 export LC_ALL="en_US.UTF-8"
 
 # === Configuração ===
-# Transcrição corre no Mac Mini M4 via SSH (alias "macmini" em ~/.ssh/config com
-# ControlMaster). O MacBook deixou de ter whisper.cpp local.
-REMOTE_HOST="macmini"
-REMOTE_WHISPER="/opt/homebrew/bin/whisper-cli"
-REMOTE_MODEL="/Users/zion/whisper.cpp/models/ggml-large-v3.bin"
-REMOTE_VAD_MODEL="/Users/zion/whisper.cpp/models/ggml-silero-v5.1.2.bin"
-REMOTE_TMP="/tmp"
+# Por omissão a transcrição corre localmente nesta máquina, usando o
+# whisper.cpp que o install.sh compila em ~/whisper.cpp. Para transcrever
+# num Mac remoto mais rápido (ex.: um Mac Mini na mesma rede via SSH),
+# criar ~/.voxtapp.env com pelo menos VOXT_REMOTE_HOST definido:
+#
+#   VOXT_REMOTE_HOST="macmini"
+#   VOXT_REMOTE_WHISPER="/opt/homebrew/bin/whisper-cli"
+#   VOXT_REMOTE_MODEL="/Users/outro-user/whisper.cpp/models/ggml-large-v3.bin"
+#   VOXT_REMOTE_VAD_MODEL="/Users/outro-user/whisper.cpp/models/ggml-silero-v5.1.2.bin"
+#   VOXT_REMOTE_TMP="/tmp"
+#   VOXT_REMOTE_THREADS=8
+#
+# Requer SSH sem password (ControlMaster/chave) para o host. Sem esse
+# ficheiro, ou sem VOXT_REMOTE_HOST definido, corre sempre local.
+VOXT_REMOTE_HOST=""
+VOXT_REMOTE_WHISPER="/opt/homebrew/bin/whisper-cli"
+VOXT_REMOTE_MODEL="$HOME/whisper.cpp/models/ggml-large-v3.bin"
+VOXT_REMOTE_VAD_MODEL="$HOME/whisper.cpp/models/ggml-silero-v5.1.2.bin"
+VOXT_REMOTE_TMP="/tmp"
+VOXT_REMOTE_THREADS=8
+[ -f "$HOME/.voxtapp.env" ] && source "$HOME/.voxtapp.env"
+
+WHISPER_DIR="$HOME/whisper.cpp"
+LOCAL_MODEL="$WHISPER_DIR/models/ggml-large-v3.bin"
+LOCAL_VAD_MODEL="$WHISPER_DIR/models/ggml-silero-v5.1.2.bin"
+if [ -f "$WHISPER_DIR/build/bin/whisper-cli" ]; then
+    LOCAL_WHISPER="$WHISPER_DIR/build/bin/whisper-cli"
+elif [ -f "$WHISPER_DIR/build/bin/main" ]; then
+    LOCAL_WHISPER="$WHISPER_DIR/build/bin/main"
+else
+    LOCAL_WHISPER=""
+fi
+LOCAL_THREADS="${VOXT_LOCAL_THREADS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
+
 AUDIO_FILE="/tmp/dictation.wav"
 TRANSCRIPT_FILE="/tmp/dictation.txt"
-THREADS=8  # Mac Mini M4 tem mais cores que o MacBook
+
+require_local_whisper() {
+    if [ -z "$LOCAL_WHISPER" ]; then
+        echo "Erro: whisper-cli não encontrado em $WHISPER_DIR/build/bin. Corre ./install.sh." >&2
+        exit 1
+    fi
+}
 
 # Anti-hallucination whisper flags:
 #   --vad + Silero VAD model → skips silent regions (the #1 cause of hallucinated
 #     "Obrigado por verem"/"Subscribe"/etc. on quiet chunks).
 #   -sns (suppress non-speech tokens), -tp 0.0 (deterministic), -nf (no temp
 #     fallback — reject low-confidence segments instead of guessing).
-WHISPER_FLAGS=(
-    -t "$THREADS"
-    -l auto
-    --no-timestamps
-    -otxt
-    --vad
-    --vad-model "$REMOTE_VAD_MODEL"
-    -vt 0.35
-    -sns
-    -tp 0.0
-    -nf
-    # -mc 0: do NOT carry decoder context across VAD segments. Without this,
-    # short recordings split by VAD produce repeat hallucinations
-    # ("Alô 1 2 3 4 5 6. Alô 1 2 3 4 5 6.") because the decoder re-emits the
-    # previous segment's tokens when it sees similar acoustic features.
-    -mc 0
-)
+# Preenche o array global WHISPER_FLAGS para o modelo VAD e nº de threads dados.
+build_flags() {
+    local vad_model="$1" threads="$2"
+    WHISPER_FLAGS=(
+        -t "$threads"
+        -l auto
+        --no-timestamps
+        -otxt
+        --vad
+        --vad-model "$vad_model"
+        -vt 0.35
+        -sns
+        -tp 0.0
+        -nf
+        # -mc 0: do NOT carry decoder context across VAD segments. Without this,
+        # short recordings split by VAD produce repeat hallucinations
+        # ("Alô 1 2 3 4 5 6. Alô 1 2 3 4 5 6.") because the decoder re-emits the
+        # previous segment's tokens when it sees similar acoustic features.
+        -mc 0
+    )
+}
 
 # Post-filter: strips whisper-large-v3 ghost phrases and collapses consecutive
 # duplicate sentences. Whisper emits same-sentence repeats on short or
@@ -161,17 +198,27 @@ transcribe() {
 
     echo "transcribing" > /tmp/dictation.state
 
-    # Transcrever no Mac Mini via SSH. Pipe áudio por stdin, capturamos texto por stdout.
-    REMOTE_BASENAME="voxt_dictation_$$"
-    cat "$AUDIO_FILE" | ssh -o BatchMode=yes "$REMOTE_HOST" "
-        set -e
-        cat > $REMOTE_TMP/$REMOTE_BASENAME.wav
-        $REMOTE_WHISPER -m $REMOTE_MODEL -f $REMOTE_TMP/$REMOTE_BASENAME.wav \
-            ${WHISPER_FLAGS[*]} \
-            -of $REMOTE_TMP/$REMOTE_BASENAME 2>/dev/null
-        cat $REMOTE_TMP/$REMOTE_BASENAME.txt 2>/dev/null || true
-        rm -f $REMOTE_TMP/$REMOTE_BASENAME.wav $REMOTE_TMP/$REMOTE_BASENAME.txt
-    " > "$TRANSCRIPT_FILE" 2>/dev/null
+    if [ -n "$VOXT_REMOTE_HOST" ]; then
+        # Transcrever num Mac remoto via SSH. Pipe áudio por stdin, capturamos texto por stdout.
+        build_flags "$VOXT_REMOTE_VAD_MODEL" "$VOXT_REMOTE_THREADS"
+        REMOTE_BASENAME="voxt_dictation_$$"
+        cat "$AUDIO_FILE" | ssh -o BatchMode=yes "$VOXT_REMOTE_HOST" "
+            set -e
+            cat > $VOXT_REMOTE_TMP/$REMOTE_BASENAME.wav
+            $VOXT_REMOTE_WHISPER -m $VOXT_REMOTE_MODEL -f $VOXT_REMOTE_TMP/$REMOTE_BASENAME.wav \
+                ${WHISPER_FLAGS[*]} \
+                -of $VOXT_REMOTE_TMP/$REMOTE_BASENAME 2>/dev/null
+            cat $VOXT_REMOTE_TMP/$REMOTE_BASENAME.txt 2>/dev/null || true
+            rm -f $VOXT_REMOTE_TMP/$REMOTE_BASENAME.wav $VOXT_REMOTE_TMP/$REMOTE_BASENAME.txt
+        " > "$TRANSCRIPT_FILE" 2>/dev/null
+    else
+        # Transcrever localmente.
+        require_local_whisper
+        build_flags "$LOCAL_VAD_MODEL" "$LOCAL_THREADS"
+        "$LOCAL_WHISPER" -m "$LOCAL_MODEL" -f "$AUDIO_FILE" \
+            "${WHISPER_FLAGS[@]}" \
+            -of "${TRANSCRIPT_FILE%.txt}" 2>/dev/null || true
+    fi
 
     # Ler texto, limpar espaços extra, remover frases-fantasma do whisper.
     if [ -f "$TRANSCRIPT_FILE" ]; then
@@ -262,22 +309,45 @@ case "${1:-}" in
             NORM_FILE="${INPUT_FILE%.wav}_norm.wav"
             /opt/homebrew/bin/sox "$INPUT_FILE" "$NORM_FILE" gain -n -3 2>/dev/null && SEND_FILE="$NORM_FILE"
         fi
-        # Transcrição corre no Mac Mini. Pipe da chunk via stdin, recebe texto via stdout.
-        REMOTE_BASENAME="voxt_$(basename "$OUT_BASE")_$$"
-        cat "$SEND_FILE" | ssh -o BatchMode=yes "$REMOTE_HOST" "
-            set -e
-            cat > $REMOTE_TMP/$REMOTE_BASENAME.wav
-            PROMPT_DECODED=
-            if [ -n '$PROMPT_B64' ]; then
-                PROMPT_DECODED=\$(printf '%s' '$PROMPT_B64' | base64 -D 2>/dev/null || printf '%s' '$PROMPT_B64' | base64 -d 2>/dev/null || true)
+        if [ -n "$VOXT_REMOTE_HOST" ]; then
+            # Transcrição corre no Mac remoto. Pipe da chunk via stdin, recebe texto via stdout.
+            build_flags "$VOXT_REMOTE_VAD_MODEL" "$VOXT_REMOTE_THREADS"
+            REMOTE_BASENAME="voxt_$(basename "$OUT_BASE")_$$"
+            cat "$SEND_FILE" | ssh -o BatchMode=yes "$VOXT_REMOTE_HOST" "
+                set -e
+                cat > $VOXT_REMOTE_TMP/$REMOTE_BASENAME.wav
+                PROMPT_DECODED=
+                if [ -n '$PROMPT_B64' ]; then
+                    PROMPT_DECODED=\$(printf '%s' '$PROMPT_B64' | base64 -D 2>/dev/null || printf '%s' '$PROMPT_B64' | base64 -d 2>/dev/null || true)
+                fi
+                $VOXT_REMOTE_WHISPER -m $VOXT_REMOTE_MODEL -f $VOXT_REMOTE_TMP/$REMOTE_BASENAME.wav \
+                    ${WHISPER_FLAGS[*]} \
+                    \${PROMPT_DECODED:+--prompt} \${PROMPT_DECODED:+\"\$PROMPT_DECODED\"} \
+                    -of $VOXT_REMOTE_TMP/$REMOTE_BASENAME 2>/dev/null
+                cat $VOXT_REMOTE_TMP/$REMOTE_BASENAME.txt 2>/dev/null || true
+                rm -f $VOXT_REMOTE_TMP/$REMOTE_BASENAME.wav $VOXT_REMOTE_TMP/$REMOTE_BASENAME.txt
+            " 2>/dev/null | strip_hallucinations > "$OUT_BASE.txt"
+        else
+            # Transcrição local.
+            require_local_whisper
+            build_flags "$LOCAL_VAD_MODEL" "$LOCAL_THREADS"
+            PROMPT_DECODED=""
+            if [ -n "$PROMPT_B64" ]; then
+                PROMPT_DECODED=$(printf '%s' "$PROMPT_B64" | base64 -D 2>/dev/null || printf '%s' "$PROMPT_B64" | base64 -d 2>/dev/null || true)
             fi
-            $REMOTE_WHISPER -m $REMOTE_MODEL -f $REMOTE_TMP/$REMOTE_BASENAME.wav \
-                ${WHISPER_FLAGS[*]} \
-                \${PROMPT_DECODED:+--prompt} \${PROMPT_DECODED:+\"\$PROMPT_DECODED\"} \
-                -of $REMOTE_TMP/$REMOTE_BASENAME 2>/dev/null
-            cat $REMOTE_TMP/$REMOTE_BASENAME.txt 2>/dev/null || true
-            rm -f $REMOTE_TMP/$REMOTE_BASENAME.wav $REMOTE_TMP/$REMOTE_BASENAME.txt
-        " 2>/dev/null | strip_hallucinations > "$OUT_BASE.txt"
+            LOCAL_BASENAME="${OUT_BASE}_tmp$$"
+            if [ -n "$PROMPT_DECODED" ]; then
+                "$LOCAL_WHISPER" -m "$LOCAL_MODEL" -f "$SEND_FILE" \
+                    "${WHISPER_FLAGS[@]}" --prompt "$PROMPT_DECODED" \
+                    -of "$LOCAL_BASENAME" 2>/dev/null || true
+            else
+                "$LOCAL_WHISPER" -m "$LOCAL_MODEL" -f "$SEND_FILE" \
+                    "${WHISPER_FLAGS[@]}" \
+                    -of "$LOCAL_BASENAME" 2>/dev/null || true
+            fi
+            cat "$LOCAL_BASENAME.txt" 2>/dev/null | strip_hallucinations > "$OUT_BASE.txt"
+            rm -f "$LOCAL_BASENAME.txt"
+        fi
         [ -n "${NORM_FILE:-}" ] && [ -f "$NORM_FILE" ] && rm -f "$NORM_FILE"
         ;;
     *)

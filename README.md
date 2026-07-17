@@ -25,9 +25,11 @@ Press a shortcut, speak, press again — your speech is transcribed and pasted w
 | macOS + Apple Silicon (M1–M4) | Metal GPU acceleration | — |
 | [Homebrew](https://brew.sh) | Package manager | See below |
 | **Hammerspoon** | Global hotkey, UI, window management | `brew install --cask hammerspoon` |
-| **sox** | Audio recording (`rec` command) | `brew install sox` |
+| **sox** | Audio capture from the mic | `brew install sox` |
+| **ffmpeg** | Chunked WAV segmenting during recording | `brew install ffmpeg` |
 | **whisper.cpp** | Local speech-to-text (offline) | Compiled from source by `install.sh` |
 | **ggml-large-v3** model | High-accuracy transcription (~3 GB) | Downloaded by `install.sh` |
+| **Silero VAD** model | Skips silence to avoid hallucinated text | Downloaded by `install.sh` |
 | **cmake**, **git** | Build tools for whisper.cpp | Usually pre-installed on macOS |
 
 > whisper.cpp runs entirely offline — no data is sent to the cloud.
@@ -49,31 +51,20 @@ chmod +x install.sh
 ```
 
 This script will:
-1. Install `sox` and `Hammerspoon` via Homebrew
-2. Clone `whisper.cpp` into `~/whisper.cpp`
-3. Compile it with Metal + Accelerate acceleration
-4. Download the `ggml-large-v3.bin` model (~3 GB, first run only)
-5. Verify the binary and model are in place
+1. Install `sox`, `ffmpeg` and `Hammerspoon` via Homebrew
+2. Copy `hammerspoon-init.lua` to `~/.hammerspoon/init.lua` and the sounds to `~/.hammerspoon/sounds/`
+3. Copy `dictate.sh` and `record-chunks.sh` to `~/scripts/`
+4. Clone `whisper.cpp` into `~/whisper.cpp` and compile it with Metal + Accelerate acceleration
+5. Download the `ggml-large-v3.bin` model (~3 GB) and the Silero VAD model (first run only)
+6. Verify everything is in place
 
 > The first run takes 5–15 minutes depending on your connection and machine.
 
-### 3. Set up Hammerspoon config
+### 3. Reload Hammerspoon
 
-```bash
-cp hammerspoon-init.lua ~/.hammerspoon/init.lua
-```
+Open Hammerspoon (it appears in your menu bar) and click **Reload Config**.
 
-Open Hammerspoon (it appears in your menu bar). It will ask to reload — click **Reload**.
-
-### 4. Set up the dictation script
-
-```bash
-mkdir -p ~/scripts
-cp dictate.sh ~/scripts/dictate.sh
-chmod +x ~/scripts/dictate.sh
-```
-
-### 5. Grant permissions
+### 4. Grant permissions
 
 Hammerspoon needs two system permissions:
 
@@ -103,22 +94,29 @@ After granting Accessibility, reload Hammerspoon from the menu bar icon.
 ⌥⌘L pressed
      │
      ▼
-Hammerspoon stores focused window → starts sox (rec)
+Hammerspoon stores focused window → record-chunks.sh starts
      │
      ▼
-sox records 16kHz mono WAV → /tmp/dictation.wav
+sox (mic) → ffmpeg segmenter → 16kHz mono WAV chunks in /tmp/voxt-chunks/
      │
      ▼
-⌥⌘L pressed again (or Enter)
+Each chunk is transcribed as it lands (whisper.cpp, large-v3 + Metal GPU,
+Silero VAD to skip silence, previous chunk's tail used as --prompt for
+continuity)
      │
      ▼
-whisper.cpp transcribes with large-v3 + Metal GPU (batch mode)
+⌥⌘L pressed again (or Enter) → last chunk flushed and transcribed
      │
      ▼
-Result → clipboard → Hammerspoon focuses original window → ⌘V paste
+Chunks' text deduplicated and joined → clipboard → Hammerspoon focuses
+original window → ⌘V paste
 ```
 
-State is managed via `/tmp/dictation.*` files (`.wav`, `.txt`, `.result`, `.state`, `.pid`).
+Transcription runs locally by default (`~/whisper.cpp`, compiled by `install.sh`).
+It can optionally run on a remote Mac over SSH instead — see
+[Transcribing on a remote Mac](#transcribing-on-a-remote-mac-optional).
+
+State is managed via `/tmp/dictation.*` files (`.txt`, `.result`, `.state`, `.pid`) and `/tmp/voxt-chunks/`.
 
 ## Customization
 
@@ -138,21 +136,37 @@ Reload Hammerspoon after any change (menu bar icon → Reload Config).
 
 ### Adjust transcription threads
 
-Edit `~/scripts/dictate.sh`, line ~21:
+Local transcription defaults to your Mac's core count. To override, set an env var before Hammerspoon starts (e.g. in `~/.voxtapp.env`, see below):
 
 ```bash
-THREADS=4   -- increase for M2/M3/M4 Pro/Max chips
+VOXT_LOCAL_THREADS=4
 ```
+
+### Transcribing on a remote Mac (optional)
+
+If you have a second, faster Mac on your network reachable over passwordless SSH, `dictate.sh` can send audio there for transcription instead of running whisper.cpp on this machine. Create `~/.voxtapp.env`:
+
+```bash
+VOXT_REMOTE_HOST="my-other-mac"          # SSH host/alias, must not prompt for a password
+VOXT_REMOTE_WHISPER="/opt/homebrew/bin/whisper-cli"
+VOXT_REMOTE_MODEL="/Users/otheruser/whisper.cpp/models/ggml-large-v3.bin"
+VOXT_REMOTE_VAD_MODEL="/Users/otheruser/whisper.cpp/models/ggml-silero-v5.1.2.bin"
+VOXT_REMOTE_TMP="/tmp"
+VOXT_REMOTE_THREADS=8
+```
+
+The remote Mac needs whisper.cpp compiled and both models present (run `install.sh` there too, or copy `~/whisper.cpp` over). Without this file, or without `VOXT_REMOTE_HOST` set, transcription always runs locally.
 
 ## Troubleshooting
 
 | Symptom | Fix |
 |---|---|
 | Nothing happens on shortcut | Check Hammerspoon has Accessibility permission |
-| "whisper binary not found" | Re-run `install.sh`; check `~/whisper.cpp/build/bin/` |
+| "whisper-cli não encontrado" | Re-run `install.sh`; check `~/whisper.cpp/build/bin/` |
 | Microphone not recording | Check Microphone permission for Hammerspoon in System Settings |
 | Very slow transcription | Ensure Metal is enabled; check `~/whisper.cpp/build/bin/whisper-cli --help` |
 | Text pasted to wrong window | Click your target window before pressing ⌥⌘L |
+| Recording fails to start | Check `ffmpeg` and `sox` are installed (`brew install ffmpeg sox`) |
 
 ## License
 
