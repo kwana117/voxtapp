@@ -101,7 +101,7 @@ let pending = [];                     // áudio à espera da ligação abrir
 let carry = Buffer.alloc(0);
 let uncommittedBytes = 0;
 let silenceMs = 0;
-let totalBytes = 0;
+let sentBytes = 0;                    // áudio que chegou à API (é o que se paga)
 let stopping = false;
 let finished = false;
 
@@ -111,10 +111,15 @@ function touchItem(id) {
     if (!texts.has(id)) { texts.set(id, ""); order.push(id); }
 }
 
-function logUsage() {
-    const secs = Math.round(totalBytes / (SAMPLE_RATE * 2));
-    if (secs > 0 && !apiFailed && !testFile) {
-        try { appendFileSync(`${homedir()}/.voxtapp-usage.log`, `${new Date().toISOString()} ${secs}\n`); } catch {}
+// Uma linha por ditado: "data segundos estado". Conta o áudio enviado, mesmo
+// em ditados cancelados ou em que a API falhou a meio, porque esse também se paga.
+let usageLogged = false;
+function logUsage(estado) {
+    if (usageLogged || testFile) return;
+    usageLogged = true;
+    const secs = Math.round(sentBytes / (SAMPLE_RATE * 2));
+    if (secs > 0) {
+        try { appendFileSync(`${homedir()}/.voxtapp-usage.log`, `${new Date().toISOString()} ${secs} ${estado}\n`, { mode: 0o600 }); } catch {}
     }
 }
 
@@ -128,7 +133,7 @@ function fail(msg) {
 function finish() {
     if (finished) return;
     finished = true;
-    logUsage();
+    logUsage(apiFailed ? "falhou" : "ok");
     const text = fullText();
     emit({ t: "final", text, failed: !text });   // sem texto → o Hammerspoon tenta o Whisper
     try { ws?.close(); } catch {}
@@ -143,10 +148,15 @@ function send(obj) {
     try { ws.send(JSON.stringify(obj)); } catch (e) { fail(`envio falhou: ${e.message}`); }
 }
 
+function sendAppend(buf) {
+    send({ type: "input_audio_buffer.append", audio: buf.toString("base64") });
+    sentBytes += buf.length;
+}
+
 function appendAudio(buf) {
     if (apiFailed) return;
     if (!wsOpen) { pending.push(buf); return; }
-    send({ type: "input_audio_buffer.append", audio: buf.toString("base64") });
+    sendAppend(buf);
 }
 
 function commit() {
@@ -170,7 +180,6 @@ function rms(buf) {
 // Junta o PCM em blocos de 100 ms, envia, e corta blocos longos numa pausa.
 function onPcm(data) {
     appendFileSync(rawPath, data, { mode: 0o600 });
-    totalBytes += data.length;
     carry = Buffer.concat([carry, data]);
     while (carry.length >= CHUNK_BYTES) {
         const chunk = carry.subarray(0, CHUNK_BYTES);
@@ -214,7 +223,7 @@ function connect() {
             case "session.updated":
                 if (!wsOpen) {
                     wsOpen = true;
-                    for (const b of pending) send({ type: "input_audio_buffer.append", audio: b.toString("base64") });
+                    for (const b of pending) sendAppend(b);
                     pending = [];
                     emit({ t: "ready" });
                     if (stopping) endStream();
@@ -307,7 +316,11 @@ function stop() {
 }
 
 process.on("SIGTERM", stop);
-process.on("SIGINT", () => { try { rec?.kill("SIGKILL"); ws?.close(); } catch {} process.exit(130); });
+process.on("SIGINT", () => {
+    logUsage("cancelado");
+    try { rec?.kill("SIGKILL"); ws?.close(); } catch {}
+    process.exit(130);
+});
 
 connect();
 if (testFile) startFile(testFile); else startMic();
