@@ -21,7 +21,8 @@ echo "[3/7] A instalar scripts em ~/scripts/..."
 mkdir -p "$HOME/scripts"
 cp "$REPO_DIR/dictate.sh" "$HOME/scripts/dictate.sh"
 cp "$REPO_DIR/record-chunks.sh" "$HOME/scripts/record-chunks.sh"
-chmod +x "$HOME/scripts/dictate.sh" "$HOME/scripts/record-chunks.sh"
+cp "$REPO_DIR/stream-dictate.mjs" "$HOME/scripts/stream-dictate.mjs"
+chmod +x "$HOME/scripts/dictate.sh" "$HOME/scripts/record-chunks.sh" "$HOME/scripts/stream-dictate.mjs"
 echo "✓ Scripts copiados para ~/scripts/"
 
 # 4. Clonar whisper.cpp

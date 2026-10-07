@@ -157,6 +157,21 @@ VOXT_REMOTE_THREADS=8
 
 The remote Mac needs whisper.cpp compiled and both models present (run `install.sh` there too, or copy `~/whisper.cpp` over). Without this file, or without `VOXT_REMOTE_HOST` set, both the pre-flight check and transcription always run locally — this is the default, so a fresh clone works standalone on a single machine with no extra setup.
 
+### Real-time transcription (optional, paid API)
+
+By default VoxTapp transcribes with whisper.cpp in 18-second blocks, so you only see the text after you stop. Real-time mode streams the audio to OpenAI's `gpt-live-transcribe` instead: the pill widens and shows the text as you speak, and that text is what gets pasted, with no wait at the end (~0.5 s). Cost: about $0.017 per minute of speech (~$1/hour). Add to `~/.voxtapp.env`:
+
+```bash
+VOXT_MODE="stream"
+VOXT_OPENAI_KEY="sk-..."                 # or point to a .env file that already holds it:
+# VOXT_OPENAI_KEY_FILE="~/.config/some-app/.env.local"
+# VOXT_OPENAI_KEY_VAR="OPENAI_API_KEY"
+```
+
+Optional: `VOXT_STREAM_DELAY` (`low`/`medium`/`high`, default `medium`: higher is more accurate but lags more), `VOXT_STREAM_LANGS` (default `pt`), `VOXT_STREAM_PROMPT`, `VOXT_KEYTERMS` (comma-separated names and jargon). Needs Node 22+ (`/opt/homebrew/bin/node`, or set `VOXT_NODE`).
+
+If the API fails (no network, bad key), the whole recording is kept and transcribed by whisper.cpp when you stop, as in block mode. Each session appends its length in seconds to `~/.voxtapp-usage.log`.
+
 ## Troubleshooting
 
 | Symptom | Fix |

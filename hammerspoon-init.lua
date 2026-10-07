@@ -5,6 +5,7 @@
 
 local dictateScript        = os.getenv("HOME") .. "/scripts/dictate.sh"
 local recordChunksScript   = os.getenv("HOME") .. "/scripts/record-chunks.sh"
+local streamScript         = os.getenv("HOME") .. "/scripts/stream-dictate.mjs"
 
 -- ============================================
 -- Configuração
@@ -71,6 +72,14 @@ local REMOTE_WHISPER         = voxtEnv.VOXT_REMOTE_WHISPER or "/opt/homebrew/bin
 local REMOTE_MODEL           = voxtEnv.VOXT_REMOTE_MODEL
 local REMOTE_VAD_MODEL       = voxtEnv.VOXT_REMOTE_VAD_MODEL
 local PREFLIGHT_TIMEOUT_SECS = 3
+-- Modo em tempo real (OpenAI gpt-live-transcribe): o texto aparece na pílula
+-- enquanto falas e é esse texto que se cola, sem espera no fim. Liga-se com
+-- VOXT_MODE="stream" em ~/.voxtapp.env (a chave: ver stream-dictate.mjs); sem
+-- isso fica o pipeline por blocos com Whisper. Se a API falhar ou não houver
+-- chave, o áudio gravado vai para o Whisper no fim, como antes.
+local STREAM_MODE            = voxtEnv.VOXT_MODE == "stream"
+local NODE_BIN               = voxtEnv.VOXT_NODE or "/opt/homebrew/bin/node"
+local STREAM_RAW_RATE        = 24000   -- stream-dictate.mjs grava o _raw.pcm a 24 kHz
 local LOCAL_WHISPER_DIR      = os.getenv("HOME") .. "/whisper.cpp"
 -- Voxtapp ALWAYS records from this device by name, regardless of the macOS
 -- default input. Prevents silent recordings when another app (meeting
@@ -112,6 +121,13 @@ local activeChunkTask    = nil   -- hs.task running whisper on a chunk
 local pendingEnrichTask  = nil   -- hs.task running sox to build enriched chunk
 local pendingFinalize    = nil   -- nil | { autoEnter = bool }
 local cancelRequested    = false
+
+local streamTask         = nil   -- hs.task do stream-dictate.mjs
+local streamBuf          = ""    -- stdout por linhas (JSON)
+local streamFinal        = nil   -- { text, failed } quando o programa acaba
+local streamLiveText     = ""
+local streamApiError     = nil
+local liveRenderTimer    = nil
 
 -- Smart paste: pending state when user switched windows
 local pendingResult = nil             -- transcribed text waiting to be pasted
@@ -197,14 +213,18 @@ local PAD = 4   -- minimal padding (shadow clipping acceptable — avoids blocki
 local VIEW_W = PILL_W + PAD * 2
 local VIEW_H = PILL_H + PAD * 2
 local PILL_Y = 8
+local EXP_PILL_W = 560   -- pílula larga do modo em tempo real
+local EXP_VIEW_W = EXP_PILL_W + PAD * 2
 
-local function getViewFrame()
+local function getViewFrame(w, h)
+    w = w or VIEW_W
+    h = h or VIEW_H
     local scr = hs.screen.mainScreen():frame()
     return hs.geometry.rect(
-        scr.x + math.floor((scr.w - VIEW_W) / 2),
+        scr.x + math.floor((scr.w - w) / 2),
         scr.y + PILL_Y,
-        VIEW_W,
-        VIEW_H
+        w,
+        h
     )
 end
 
@@ -327,6 +347,29 @@ local function shellHTML()
                 letter-spacing: 0.3px;
             }
             .badge.hidden { display: none; }
+            /* === Pílula larga com texto ao vivo (modo em tempo real) === */
+            .pill.expanded {
+                width: %dpx;
+                height: auto;
+                min-height: %dpx;
+                flex-wrap: wrap;
+                padding: 12px 16px;
+            }
+            .live {
+                flex-basis: 100%%;
+                margin-top: 8px;
+                max-height: 80px;          /* 4 linhas; o início sai por cima */
+                overflow: hidden;
+                display: flex;
+                flex-direction: column;
+                justify-content: flex-end;
+                font-size: 14px;
+                line-height: 20px;
+                font-weight: 400;
+                color: rgba(255,255,255,0.95);
+                white-space: normal;
+            }
+            .live.hidden { display: none; }
         </style></head>
         <body>
             <div class="wrapper">
@@ -335,11 +378,12 @@ local function shellHTML()
                     <div class="spinner hidden" id="spinner"></div>
                     <div class="text" id="text"></div>
                     <div class="badge hidden" id="badge"></div>
+                    <div class="live hidden" id="live"><span id="liveText"></span></div>
                 </div>
             </div>
         </body>
         </html>
-    ]], PAD, PILL_W, PILL_H)
+    ]], PAD, PILL_W, PILL_H, EXP_PILL_W, PILL_H)
 end
 
 local function ensurePill(onReady)
@@ -368,8 +412,27 @@ local function ensurePill(onReady)
     end)
 end
 
+-- Ajusta a altura da janela à pílula larga (cresce para baixo, topo fixo).
+local function fitPillToContent()
+    if not pillView then return end
+    -- 0 se a pílula já voltou ao tamanho normal (a resposta chega assíncrona).
+    pillView:evaluateJavaScript(
+        "(function(){var p=document.getElementById('pill');return p.className.indexOf('expanded')<0?0:p.offsetHeight;})()",
+        function(h)
+        h = tonumber(h)
+        if h and h > 0 and pillView then pillView:frame(getViewFrame(EXP_VIEW_W, h + PAD * 2)) end
+    end)
+end
+
 local function updatePill(opts)
+    -- Se a pílula já estava larga, mantém a altura (evita cortar o texto até
+    -- o fitPillToContent responder).
+    local prev = pillView and pillView:frame()
     ensurePill()
+    if opts.expanded then
+        local h = (prev and prev.w == EXP_VIEW_W) and prev.h or (VIEW_H + 40)
+        pillView:frame(getViewFrame(EXP_VIEW_W, h))
+    end
     local safeText  = (opts.text  or ""):gsub("\\", "\\\\"):gsub("'", "\\'")
     local safeBadge = (opts.badge or ""):gsub("\\", "\\\\"):gsub("'", "\\'")
     local js = string.format([[
@@ -393,6 +456,13 @@ local function updatePill(opts)
 
             badge.className   = %s ? 'badge' : 'badge hidden';
             badge.textContent = '%s';
+
+            var expanded = %s;
+            pill.className = expanded ? 'pill expanded' : 'pill';
+            if (!expanded) {
+                document.getElementById('liveText').textContent = '';
+                document.getElementById('live').className = 'live hidden';
+            }
         })();
     ]],
         opts.bg    or "rgba(28,28,32,0.82)",
@@ -401,9 +471,35 @@ local function updatePill(opts)
         opts.showSpinner and "true" or "false",
         safeText,
         opts.badge and "true" or "false",
-        safeBadge
+        safeBadge,
+        opts.expanded and "true" or "false"
     )
     pillView:evaluateJavaScript(js)
+    if opts.expanded then fitPillToContent() end
+end
+
+-- Texto ao vivo na pílula larga. Só o fim do texto (o resto sai por cima).
+local function renderLiveText()
+    liveRenderTimer = nil
+    if not pillView then return end
+    local text = streamLiveText or ""
+    local n = utf8.len(text)
+    if n and n > 400 then text = "\xe2\x80\xa6" .. text:sub(utf8.offset(text, n - 400)) end
+    pillView:evaluateJavaScript(string.format([[
+        (function() {
+            if (document.getElementById('pill').className.indexOf('expanded') < 0) return;
+            var t = %s.t;
+            document.getElementById('liveText').textContent = t;
+            document.getElementById('live').className = t ? 'live' : 'live hidden';
+        })();
+    ]], hs.json.encode({ t = text })))
+    fitPillToContent()
+end
+
+local function setLiveText(text)
+    streamLiveText = text or ""
+    -- No máximo um redesenho a cada 80 ms (chegam ~10 pedaços por segundo).
+    if not liveRenderTimer then liveRenderTimer = hs.timer.doAfter(0.08, renderLiveText) end
 end
 
 -- ============================================
@@ -530,6 +626,19 @@ local function showRecording()
         color    = "rgba(255,255,255,0.92)",
         showWave = true,
         badge    = "\xe2\x87\xa7 Paste  \xe2\x86\xb5 Send",
+        expanded = STREAM_MODE,
+    })
+end
+
+-- Modo em tempo real: o texto continua visível enquanto chega o último bocado.
+local function showFinishing()
+    updatePill({
+        text        = "A terminar\xe2\x80\xa6",
+        bg          = "rgba(24, 26, 40, 0.82)",
+        color       = "rgba(140, 170, 255, 0.92)",
+        showSpinner = true,
+        badge       = "ESC Cancel",
+        expanded    = true,
     })
 end
 
@@ -605,6 +714,7 @@ local function showMicWarning()
         color    = "rgba(255, 200, 100, 0.95)",
         showWave = true,
         badge    = "ESC Cancel",
+        expanded = STREAM_MODE,
     })
 end
 
@@ -644,6 +754,17 @@ local function runPreflight(onOK, onFail)
     -- bail with a specific error instead of recording silence.
     if not hs.audiodevice.findInputByName(INPUT_DEVICE_NAME) then
         onFail("Mic n\xc3\xa3o encontrado: " .. INPUT_DEVICE_NAME)
+        return
+    end
+
+    if STREAM_MODE then
+        -- A transcrição vai para a API; o Whisper remoto só entra se ela falhar,
+        -- por isso não se atrasa o arranque com o teste por SSH.
+        if hs.fs.attributes(NODE_BIN) and hs.fs.attributes(streamScript) then
+            onOK()
+        else
+            onFail("Node ou stream-dictate.mjs em falta")
+        end
         return
     end
 
@@ -772,6 +893,7 @@ end
 -- Forward-declared because of mutual recursion via callbacks.
 local processNextChunk
 local maybeFinalize
+local deliverResult
 
 local function transcribeChunkAt(idx, done)
     local current = chunkPath(idx)
@@ -903,6 +1025,12 @@ maybeFinalize = function()
 
     if chunkWatcher then chunkWatcher:stop(); chunkWatcher = nil end
 
+    deliverResult(result, autoEnter)
+end
+
+-- Cola o texto na janela de origem (ou deixa-o pendente se mudaste de janela).
+deliverResult = function(result, autoEnter)
+    stopLoadingSound()
     if result ~= "" then
         hs.pasteboard.setContents(result)
         local currentWindow = hs.window.focusedWindow()
@@ -961,7 +1089,134 @@ local function onRecPipelineExit(_code, _out, _err)
     processNextChunk()
 end
 
+-- ============================================
+-- Dictation control (modo em tempo real)
+-- ============================================
+-- Fallback: se a API falhou, transcreve com o Whisper o áudio todo que o
+-- stream-dictate.mjs gravou em _raw.pcm.
+local function runWhisperFallback(autoEnter, partialText)
+    if not hs.fs.attributes(RAW_TAP) then
+        deliverResult(partialText or "", autoEnter)
+        return
+    end
+    showTranscribing()
+    startLoadingSound()
+    local wav, outBase = CHUNK_DIR .. "/_full.wav", CHUNK_DIR .. "/_full"
+    local cmd = string.format(
+        "/opt/homebrew/bin/sox -t raw -r %d -e signed -b 16 -c 1 %q -r 16000 %q && %q transcribe-chunk %q %q",
+        STREAM_RAW_RATE, RAW_TAP, wav, dictateScript, wav, outBase)
+    activeChunkTask = hs.task.new("/bin/bash", function()
+        activeChunkTask = nil
+        if cancelRequested then return end
+        local txt = ""
+        local f = io.open(outBase .. ".txt", "r")
+        if f then txt = f:read("*a"):gsub("^%s+", ""):gsub("%s+$", ""); f:close() end
+        if txt == "" or txt == "[BLANK_AUDIO]" then txt = partialText or "" end
+        deliverResult(txt, autoEnter)
+    end, { "-c", cmd })
+    activeChunkTask:start()
+end
+
+local function onStreamOutput(_task, out, _err)
+    streamBuf = streamBuf .. (out or "")
+    while true do
+        local line, rest = streamBuf:match("^(.-)\n(.*)$")
+        if not line then break end
+        streamBuf = rest
+        local ok, ev = false, nil
+        if line:match("^%s*{") then ok, ev = pcall(hs.json.decode, line) end
+        if ok and type(ev) == "table" then
+            if ev.t == "live" then
+                if not cancelRequested then setLiveText(ev.text) end
+            elseif ev.t == "final" then
+                streamFinal = ev
+            elseif ev.t == "error" then
+                streamApiError = ev.msg
+                hs.printf("voxtapp stream: %s", tostring(ev.msg))
+                if isRecording then
+                    setLiveText("\xe2\x9a\xa0 A API falhou (" .. tostring(ev.msg) ..
+                        "). Continua a falar: o Whisper transcreve no fim.")
+                end
+            end
+        end
+    end
+    return true
+end
+
+local finishStream
+
+local function onStreamExit(_code, out, _err)
+    streamTask = nil
+    if cancelRequested then return end
+    -- O que ainda não passou pelo callback de streaming vem aqui; e dá-se um
+    -- instante a callbacks atrasados, senão a linha "final" pode perder-se.
+    onStreamOutput(nil, (out or "") .. "\n", nil)
+    hs.timer.doAfter(0.15, finishStream)
+end
+
+finishStream = function()
+    if cancelRequested then return end
+    onStreamOutput(nil, "\n", nil)
+    local autoEnter = pendingFinalize and pendingFinalize.autoEnter or false
+    if isRecording then
+        -- O programa morreu a meio da gravação: fecha a gravação e entrega o
+        -- que houver, sem Enter automático (não foste tu a parar).
+        isRecording = false
+        recordingStartTime = nil
+        enterHotkey:disable()
+        shiftHotkey:stop()
+        stopWaveAnimation()
+        stopMicMonitor()
+        isTranscribing = true
+        autoEnter = false
+    end
+    pendingFinalize = nil
+    local text = (streamFinal and streamFinal.text) or ""
+    hs.printf("voxtapp stream: fim (%d caracteres, final=%s, falhou=%s, erro=%s)",
+        #text, tostring(streamFinal ~= nil), tostring(streamFinal and streamFinal.failed),
+        tostring(streamApiError))
+    if text ~= "" and not (streamFinal and streamFinal.failed) and not streamApiError then
+        deliverResult(text, autoEnter)
+    else
+        runWhisperFallback(autoEnter, text)
+    end
+end
+
+local function beginStreamRecording()
+    targetWindow = hs.window.focusedWindow()
+    targetApp    = hs.application.frontmostApplication()
+
+    escHotkey:start()
+    enterHotkey:enable()
+    shiftHotkey:start()
+
+    if dismissTimer then dismissTimer:stop(); dismissTimer = nil end
+    recordingStartTime = hs.timer.secondsSinceEpoch()
+    resetChunkState()
+    streamBuf, streamFinal, streamLiveText, streamApiError = "", nil, "", nil
+    playSoundFile("confirmation-001.mp3", 0.8)
+    ensurePill(function()
+        showRecording()
+        startWaveAnimation()
+    end)
+
+    -- O programa recria o CHUNK_DIR e grava lá o _raw.pcm (monitor de mic + fallback).
+    -- O callback de streaming tem de ir no construtor: com setStreamingCallback
+    -- o Hammerspoon só entrega o stdout no fim e o texto não aparece ao vivo.
+    streamTask = hs.task.new(NODE_BIN, onStreamExit, onStreamOutput, { streamScript, CHUNK_DIR })
+    streamTask:setEnvironment({
+        HOME = os.getenv("HOME"),
+        PATH = "/opt/homebrew/bin:/usr/bin:/bin",
+        VOXT_INPUT_DEVICE = INPUT_DEVICE_NAME,
+        LANG = "en_US.UTF-8",
+        LC_ALL = "en_US.UTF-8",
+    })
+    streamTask:start()
+    startMicMonitor()
+end
+
 local function beginRecording()
+    if STREAM_MODE then return beginStreamRecording() end
     -- Guardar janela ativa AGORA (antes de qualquer mudança de foco)
     targetWindow = hs.window.focusedWindow()
     targetApp    = hs.application.frontmostApplication()
@@ -1046,11 +1301,18 @@ function stopDictation(autoEnter, stopSound)
     else
         playSound("Pop", 0.35)
     end
+    isTranscribing = true
+    pendingFinalize = { autoEnter = autoEnter }
+
+    if STREAM_MODE then
+        -- SIGTERM: o programa fecha o último bloco e devolve o texto final (~0,5 s).
+        showFinishing()
+        if streamTask and streamTask:isRunning() then streamTask:terminate() end
+        return
+    end
+
     showTranscribing()
     startLoadingSound()
-    isTranscribing = true
-
-    pendingFinalize = { autoEnter = autoEnter }
     if recPipelineTask and recPipelineTask:isRunning() then
         recPipelineTask:terminate()  -- bash script's trap flushes ffmpeg's last chunk
     else
@@ -1076,6 +1338,7 @@ local function cancelDictation()
     cancelRequested = true
     pendingFinalize = nil
     if recPipelineTask and recPipelineTask:isRunning() then recPipelineTask:terminate() end
+    if streamTask and streamTask:isRunning() then streamTask:interrupt() end
     if pendingEnrichTask and pendingEnrichTask:isRunning() then pendingEnrichTask:terminate() end
     if activeChunkTask and activeChunkTask:isRunning() then activeChunkTask:terminate() end
     activeChunkTask    = nil
@@ -1093,6 +1356,7 @@ local function cancelTranscription()
     cancelRequested = true
     pendingFinalize = nil
     if recPipelineTask and recPipelineTask:isRunning() then recPipelineTask:terminate() end
+    if streamTask and streamTask:isRunning() then streamTask:interrupt() end
     if pendingEnrichTask and pendingEnrichTask:isRunning() then pendingEnrichTask:terminate() end
     if activeChunkTask and activeChunkTask:isRunning() then activeChunkTask:terminate() end
     activeChunkTask    = nil
@@ -1212,7 +1476,7 @@ hs.timer.doAfter(0.8, function()
     end)
 end)
 
-hs.printf("Whisper Dictation loaded — \xe2\x8c\xa5\xe2\x8c\x98L toggle (webview pill v4)")
+hs.printf("Whisper Dictation loaded — \xe2\x8c\xa5\xe2\x8c\x98L toggle (webview pill v4, modo %s)", STREAM_MODE and "tempo real" or "blocos")
 
 -- ─── Zion voice assistant module ───────────────────────────────────────────
 -- Cmd+Alt+Z toggle · Esc cancela · reusa sons de ~/.hammerspoon/sounds/
