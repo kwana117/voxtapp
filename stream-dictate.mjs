@@ -20,7 +20,7 @@
 // Cada sessão acrescenta "data segundos" a ~/.voxtapp-usage.log (custo = minutos × 0,017 $).
 
 import { spawn } from "node:child_process";
-import { appendFileSync, mkdirSync, readFileSync, rmSync, openSync, readSync, closeSync } from "node:fs";
+import { appendFileSync, chmodSync, lstatSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 
 const SAMPLE_RATE = 24000;              // o que a API Realtime espera
@@ -73,8 +73,18 @@ const fileIdx = process.argv.indexOf("--file");
 const testFile = fileIdx > 0 ? process.argv[fileIdx + 1] : null;
 const rawPath = `${dir}/_raw.pcm`;
 
+// A pasta guarda a tua voz e vive em /tmp: só tu a lês (700/600), e recusa-se
+// se alguém a tiver trocado por um link ou for de outro utilizador.
 rmSync(dir, { recursive: true, force: true });
-mkdirSync(dir, { recursive: true });
+{
+    let st = null;
+    try { mkdirSync(dir, { mode: 0o700 }); st = lstatSync(dir); } catch { /* alguém a criou entretanto */ }
+    if (!st || st.isSymbolicLink() || !st.isDirectory() || st.uid !== process.getuid()) {
+        process.stdout.write(JSON.stringify({ t: "final", text: "", failed: true }) + "\n");
+        process.exit(1);
+    }
+    chmodSync(dir, 0o700);
+}
 
 process.stdout.on("error", () => {});   // Hammerspoon pode fechar o pipe primeiro
 const emit = (obj) => process.stdout.write(JSON.stringify(obj) + "\n");
@@ -159,7 +169,7 @@ function rms(buf) {
 
 // Junta o PCM em blocos de 100 ms, envia, e corta blocos longos numa pausa.
 function onPcm(data) {
-    appendFileSync(rawPath, data);
+    appendFileSync(rawPath, data, { mode: 0o600 });
     totalBytes += data.length;
     carry = Buffer.concat([carry, data]);
     while (carry.length >= CHUNK_BYTES) {

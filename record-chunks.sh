@@ -12,6 +12,8 @@
 # real audio source).
 
 set -euo pipefail
+# Os blocos guardam a tua voz em /tmp: só o próprio utilizador os lê.
+umask 077
 
 export PATH="/opt/homebrew/bin:$PATH"
 export LANG="en_US.UTF-8"
