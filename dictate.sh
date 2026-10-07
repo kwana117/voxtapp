@@ -200,6 +200,8 @@ transcribe() {
 
     if [ -n "$VOXT_REMOTE_HOST" ]; then
         # Transcrever num Mac remoto via SSH. Pipe áudio por stdin, capturamos texto por stdout.
+        # O whisper-cli também imprime o texto no stdout; tem de ir para /dev/null,
+        # senão o texto chega duas vezes (stdout + cat do .txt) e cola-se ao repetido.
         build_flags "$VOXT_REMOTE_VAD_MODEL" "$VOXT_REMOTE_THREADS"
         REMOTE_BASENAME="voxt_dictation_$$"
         cat "$AUDIO_FILE" | ssh -o BatchMode=yes "$VOXT_REMOTE_HOST" "
@@ -207,7 +209,7 @@ transcribe() {
             cat > $VOXT_REMOTE_TMP/$REMOTE_BASENAME.wav
             $VOXT_REMOTE_WHISPER -m $VOXT_REMOTE_MODEL -f $VOXT_REMOTE_TMP/$REMOTE_BASENAME.wav \
                 ${WHISPER_FLAGS[*]} \
-                -of $VOXT_REMOTE_TMP/$REMOTE_BASENAME 2>/dev/null
+                -of $VOXT_REMOTE_TMP/$REMOTE_BASENAME >/dev/null 2>&1
             cat $VOXT_REMOTE_TMP/$REMOTE_BASENAME.txt 2>/dev/null || true
             rm -f $VOXT_REMOTE_TMP/$REMOTE_BASENAME.wav $VOXT_REMOTE_TMP/$REMOTE_BASENAME.txt
         " > "$TRANSCRIPT_FILE" 2>/dev/null
@@ -323,7 +325,7 @@ case "${1:-}" in
                 $VOXT_REMOTE_WHISPER -m $VOXT_REMOTE_MODEL -f $VOXT_REMOTE_TMP/$REMOTE_BASENAME.wav \
                     ${WHISPER_FLAGS[*]} \
                     \${PROMPT_DECODED:+--prompt} \${PROMPT_DECODED:+\"\$PROMPT_DECODED\"} \
-                    -of $VOXT_REMOTE_TMP/$REMOTE_BASENAME 2>/dev/null
+                    -of $VOXT_REMOTE_TMP/$REMOTE_BASENAME >/dev/null 2>&1
                 cat $VOXT_REMOTE_TMP/$REMOTE_BASENAME.txt 2>/dev/null || true
                 rm -f $VOXT_REMOTE_TMP/$REMOTE_BASENAME.wav $VOXT_REMOTE_TMP/$REMOTE_BASENAME.txt
             " 2>/dev/null | strip_hallucinations > "$OUT_BASE.txt"
