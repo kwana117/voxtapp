@@ -6,6 +6,7 @@
 local dictateScript        = os.getenv("HOME") .. "/scripts/dictate.sh"
 local recordChunksScript   = os.getenv("HOME") .. "/scripts/record-chunks.sh"
 local streamScript         = os.getenv("HOME") .. "/scripts/stream-dictate.mjs"
+local scenesScript         = os.getenv("HOME") .. "/.hammerspoon/voxtap-scenes.js"
 
 -- ============================================
 -- Configuração
@@ -236,6 +237,7 @@ local OFF_SCREEN_FRAME = hs.geometry.rect(-9999, -9999, VIEW_W, VIEW_H)
 -- window server's hit-test stack and silently swallows clicks at its last on-screen frame.
 local function movePillOffScreen()
     if pillView then
+        pillView:evaluateJavaScript("window.voxScene&&voxScene(false)")
         pillView:hide()
         pillView:alpha(0)
         pillView:frame(OFF_SCREEN_FRAME)
@@ -245,8 +247,28 @@ end
 -- ============================================
 -- HTML shell (pill centred inside padded webview)
 -- ============================================
+-- Liga a pílula ao voxtap-scenes.js: voxLvl recebe os valores do microfone,
+-- voxScene liga/desliga a cena, voxPreview põe uma voz falsa a tocar. As
+-- barras pequenas também passam a seguir a voz verdadeira.
+local SCENE_GLUE = [[<script>
+(function() {
+    if (!window.VoxScenes) return;
+    var vs = null, SHAPE = [.55, .8, 1, .8, .55];
+    function inst() { return vs || (vs = VoxScenes.create(document.getElementById('scene'))); }
+    window.voxScene = function(on, id, rot) { on ? inst().show(id, rot) : inst().hide(); };
+    window.voxLvl = function(v) { VoxScenes.feed(v[0], v[1], v[2], v[3]); };
+    window.voxPreview = function(on) { VoxScenes.simulate(on); };
+    VoxScenes.onLevel = function(l) {
+        var w = document.getElementById('wave');
+        if (!w || w.className !== 'wave') return;
+        var b = w.querySelectorAll('b');
+        for (var i = 0; i < b.length; i++) b[i].style.height = Math.round(4 + l * 16 * SHAPE[i] * (.8 + Math.random() * .4)) + 'px';
+    };
+})();
+</script>]]
+
 local function shellHTML()
-    return string.format([[
+    local html = string.format([[
         <html>
         <head><style>
             * { margin:0; padding:0; box-sizing:border-box; pointer-events:none !important; }
@@ -290,7 +312,13 @@ local function shellHTML()
                 color: rgba(255,255,255,0.9);
                 transition: background 0.3s ease, color 0.3s ease;
                 animation: pillIn 0.22s ease-out;
+                position: relative;
+                overflow: hidden;
             }
+            /* === Cena por trás do texto ao vivo (voxtap-scenes.js) === */
+            #scene { position: absolute; inset: 0; width: 100%%; height: 100%%; opacity: 0; }
+            .pill:not(.expanded) #scene { display: none; }
+            .pill > :not(#scene) { position: relative; }
             /* === Wave bars (recording state) === */
             .wave {
                 display: flex;
@@ -367,6 +395,7 @@ local function shellHTML()
                 line-height: 20px;
                 font-weight: 400;
                 color: rgba(255,255,255,0.95);
+                text-shadow: 0 1px 3px rgba(0,0,0,0.55);
                 white-space: normal;
             }
             .live.hidden { display: none; }
@@ -374,6 +403,7 @@ local function shellHTML()
         <body>
             <div class="wrapper">
                 <div class="pill" id="pill">
+                    <canvas id="scene"></canvas>
                     <div class="wave hidden" id="wave"><b></b><b></b><b></b><b></b><b></b></div>
                     <div class="spinner hidden" id="spinner"></div>
                     <div class="text" id="text"></div>
@@ -381,9 +411,16 @@ local function shellHTML()
                     <div class="live hidden" id="live"><span id="liveText"></span></div>
                 </div>
             </div>
+            <!--SCENES-->
         </body>
         </html>
     ]], PAD, PILL_W, PILL_H, EXP_PILL_W, PILL_H)
+    -- As cenas vêm de um ficheiro à parte (o mesmo da página de demonstração);
+    -- junta-se fora do string.format para os % do JavaScript não contarem.
+    local f = io.open(scenesScript, "r")
+    local js = f and f:read("a") or ""
+    if f then f:close() end
+    return (html:gsub("<!%-%-SCENES%-%->", function() return "<script>" .. js .. "</script>" .. SCENE_GLUE end))
 end
 
 local function ensurePill(onReady)
@@ -459,6 +496,7 @@ local function updatePill(opts)
 
             var expanded = %s;
             pill.className = expanded ? 'pill expanded' : 'pill';
+            if (!(expanded && %s) && window.voxScene) voxScene(false);
             if (!expanded) {
                 document.getElementById('liveText').textContent = '';
                 document.getElementById('live').className = 'live hidden';
@@ -472,7 +510,8 @@ local function updatePill(opts)
         safeText,
         opts.badge and "true" or "false",
         safeBadge,
-        opts.expanded and "true" or "false"
+        opts.expanded and "true" or "false",
+        opts.showWave and "true" or "false"
     )
     pillView:evaluateJavaScript(js)
     if opts.expanded then fitPillToContent() end
@@ -500,6 +539,81 @@ local function setLiveText(text)
     streamLiveText = text or ""
     -- No máximo um redesenho a cada 80 ms (chegam ~10 pedaços por segundo).
     if not liveRenderTimer then liveRenderTimer = hs.timer.doAfter(0.08, renderLiveText) end
+end
+
+-- ============================================
+-- Cena por trás do texto ao vivo (menu na barra)
+-- ============================================
+-- Escolhe-se no menu: uma cena fixa, alternar a cada ditado, alternar durante
+-- o ditado (troca a cada SCENE_ROTATE_SECS), aleatória, ou nenhuma.
+local SCENES = {
+    { id = "ribbon",        name = "Fita l\xc3\xadquida" },
+    { id = "particles",     name = "Part\xc3\xadculas" },
+    { id = "ripples",       name = "Anel de ondas" },
+    { id = "aurora",        name = "Aurora" },
+    { id = "lava",          name = "Bolhas de luz" },
+    { id = "constellation", name = "Constela\xc3\xa7\xc3\xa3o" },
+}
+local SCENE_ROTATE_SECS = 12
+local scenePreviewTimer = nil
+
+local function sceneIndex(id)
+    for i, sc in ipairs(SCENES) do if sc.id == id then return i end end
+    return 1
+end
+local function sceneMode() return hs.settings.get("voxtap.sceneMode") or "fixed" end
+local function sceneId() return SCENES[sceneIndex(hs.settings.get("voxtap.scene"))].id end
+
+-- Cena para este ditado (avança a de "alternar a cada ditado").
+local function nextScene()
+    local mode = sceneMode()
+    if mode == "off" then return nil end
+    if mode == "random" then return SCENES[math.random(#SCENES)].id, 0 end
+    if mode == "rotate" then return sceneId(), SCENE_ROTATE_SECS end
+    if mode == "cycle" then
+        local i = (hs.settings.get("voxtap.sceneCycle") or 0) % #SCENES + 1
+        hs.settings.set("voxtap.sceneCycle", i)
+        return SCENES[i].id, 0
+    end
+    return sceneId(), 0
+end
+
+local function startScene(id, rotate)
+    if not pillView or not id then return end
+    pillView:evaluateJavaScript(string.format("window.voxScene&&voxScene(true,'%s',%d)", id, rotate or 0))
+end
+
+local function stopScenePreview()
+    if scenePreviewTimer then scenePreviewTimer:stop(); scenePreviewTimer = nil end
+    if pillView then pillView:evaluateJavaScript("window.voxPreview&&voxPreview(false)") end
+end
+
+-- Mostra a pílula 6 s com uma voz falsa, para ver a cena sem ditar.
+local function previewScene(id)
+    if isRecording or isTranscribing then return end
+    stopScenePreview()
+    ensurePill(function()
+        if isRecording then return end
+        updatePill({
+            text     = "Pr\xc3\xa9-visualiza\xc3\xa7\xc3\xa3o",
+            bg       = "rgba(28, 28, 32, 0.82)",
+            color    = "rgba(255,255,255,0.92)",
+            showWave = true,
+            badge    = SCENES[sceneIndex(id)].name,
+            expanded = true,
+        })
+        setLiveText("Assim fica a cena por tr\xc3\xa1s do texto enquanto falas. " ..
+            "Os graves aquecem a cor, os agudos arrefecem, e no sil\xc3\xaancio fica a respirar devagar.")
+        startScene(id, sceneMode() == "rotate" and 3 or 0)
+        if pillView then pillView:evaluateJavaScript("window.voxPreview&&voxPreview(true)") end
+        scenePreviewTimer = hs.timer.doAfter(6, function()
+            scenePreviewTimer = nil
+            if isRecording or isTranscribing then return end
+            stopScenePreview()
+            setLiveText("")
+            movePillOffScreen()
+        end)
+    end)
 end
 
 -- ============================================
@@ -1126,7 +1240,11 @@ local function onStreamOutput(_task, out, _err)
         local ok, ev = false, nil
         if line:match("^%s*{") then ok, ev = pcall(hs.json.decode, line) end
         if ok and type(ev) == "table" then
-            if ev.t == "live" then
+            if ev.t == "lvl" then
+                if isRecording and pillView and type(ev.v) == "table" then
+                    pillView:evaluateJavaScript("window.voxLvl&&voxLvl(" .. hs.json.encode(ev.v) .. ")")
+                end
+            elseif ev.t == "live" then
                 if not cancelRequested then setLiveText(ev.text) end
             elseif ev.t == "final" then
                 streamFinal = ev
@@ -1195,9 +1313,12 @@ local function beginStreamRecording()
     resetChunkState()
     streamBuf, streamFinal, streamLiveText, streamApiError = "", nil, "", nil
     playSoundFile("confirmation-001.mp3", 0.8)
+    stopScenePreview()
+    -- Sem animação falsa: as barras e a cena seguem o volume que o programa envia.
+    local scene, rotate = nextScene()
     ensurePill(function()
         showRecording()
-        startWaveAnimation()
+        startScene(scene, rotate)
     end)
 
     -- O programa recria o CHUNK_DIR e grava lá o _raw.pcm (monitor de mic + fallback).
@@ -1456,6 +1577,137 @@ hs.audiodevice.watcher.start()
 -- One-shot check on load: if the user reloads Hammerspoon while the input is
 -- already mismatched, surface that immediately.
 hs.timer.doAfter(1.5, checkDefaultInput)
+
+-- ============================================
+-- Menu na barra: que cena aparece por trás do texto ao vivo
+-- ============================================
+-- Ícones desenhados à mão (16x16, a preto, "template": o macOS pinta-os da
+-- cor certa no menu claro ou escuro).
+local function drawIcon(elements, size)
+    size = size or 16
+    local c = hs.canvas.new({ x = 0, y = 0, w = size, h = size })
+    for _, e in ipairs(elements) do
+        e.strokeColor = e.strokeColor or { white = 0, alpha = 1 }
+        e.fillColor = e.fillColor or { white = 0, alpha = 1 }
+        e.strokeWidth = e.strokeWidth or 1.4
+        c:appendElements(e)
+    end
+    local img = c:imageFromCanvas()
+    c:delete()
+    return img and img:template(true)
+end
+
+local function wavePoints(y, amp, freq, phase)
+    local pts = {}
+    for x = 1, 15, 1 do
+        pts[#pts + 1] = { x = x, y = y + amp * math.sin((x / 15) * freq * 2 * math.pi + phase) }
+    end
+    return pts
+end
+
+local function dot(x, y, r)
+    return { type = "circle", center = { x = x, y = y }, radius = r or 1.2, action = "fill" }
+end
+
+local SCENE_ICONS = {
+    ribbon = function() return drawIcon({
+        { type = "segments", coordinates = wavePoints(8, 4, 1.2, 0), action = "stroke" },
+        { type = "segments", coordinates = wavePoints(8, 3, 1.8, 2), action = "stroke", strokeColor = { white = 0, alpha = 0.55 } },
+    }) end,
+    particles = function() return drawIcon({
+        dot(3, 9), dot(5, 5, 1), dot(7, 11), dot(8, 7, 1.5), dot(10, 4, 1), dot(11, 10), dot(13, 7, 1.3), dot(4, 12, 0.9),
+    }) end,
+    ripples = function() return drawIcon({
+        { type = "oval", frame = { x = 6, y = 6.5, w = 4, h = 3 }, action = "stroke" },
+        { type = "oval", frame = { x = 3.5, y = 4.5, w = 9, h = 7 }, action = "stroke", strokeColor = { white = 0, alpha = 0.7 } },
+        { type = "oval", frame = { x = 1, y = 2.5, w = 14, h = 11 }, action = "stroke", strokeColor = { white = 0, alpha = 0.4 } },
+    }) end,
+    aurora = function() return drawIcon({
+        { type = "rectangle", frame = { x = 2, y = 7, w = 1.6, h = 7 }, action = "fill" },
+        { type = "rectangle", frame = { x = 5, y = 3, w = 1.6, h = 11 }, action = "fill" },
+        { type = "rectangle", frame = { x = 8, y = 5, w = 1.6, h = 9 }, action = "fill" },
+        { type = "rectangle", frame = { x = 11, y = 2, w = 1.6, h = 12 }, action = "fill" },
+        { type = "rectangle", frame = { x = 14, y = 8, w = 1.4, h = 6 }, action = "fill" },
+    }) end,
+    lava = function() return drawIcon({
+        dot(5.5, 6, 3.5), dot(11, 9.5, 3.8), dot(6, 12, 2),
+    }) end,
+    constellation = function() return drawIcon({
+        { type = "segments", coordinates = { { x = 2, y = 12 }, { x = 6, y = 4 }, { x = 10, y = 9 }, { x = 14, y = 3 } }, action = "stroke", strokeWidth = 1 },
+        { type = "segments", coordinates = { { x = 6, y = 4 }, { x = 12, y = 13 }, { x = 10, y = 9 } }, action = "stroke", strokeWidth = 1 },
+        dot(2, 12, 1.5), dot(6, 4, 1.5), dot(10, 9, 1.5), dot(14, 3, 1.5), dot(12, 13, 1.5),
+    }) end,
+}
+
+local MODE_ICONS = {
+    cycle   = "NSRefreshTemplate",
+    rotate  = "NSSlideshowTemplate",
+    random  = "NSShareTemplate",
+    off     = "NSStopProgressTemplate",
+    preview = "NSQuickLookTemplate",
+}
+
+local iconCache = {}
+local function menuIcon(key)
+    if iconCache[key] == nil then
+        local img = SCENE_ICONS[key] and SCENE_ICONS[key]() or hs.image.imageFromName(MODE_ICONS[key] or "")
+        iconCache[key] = img or false
+    end
+    return iconCache[key] or nil
+end
+
+local function sceneMenu()
+    local mode, current = sceneMode(), sceneId()
+    local items = { { title = "Cena por tr\xc3\xa1s do texto", disabled = true } }
+    for _, sc in ipairs(SCENES) do
+        local id = sc.id
+        items[#items + 1] = {
+            title = sc.name, image = menuIcon(id),
+            checked = (mode == "fixed" or mode == "rotate") and id == current,
+            fn = function()
+                hs.settings.set("voxtap.scene", id)
+                if mode ~= "rotate" then hs.settings.set("voxtap.sceneMode", "fixed") end
+                previewScene(id)
+            end,
+        }
+    end
+    items[#items + 1] = { title = "-" }
+    local modes = {
+        { key = "cycle",  title = "Alternar a cada ditado" },
+        { key = "rotate", title = string.format("Alternar durante o ditado (a cada %d s)", SCENE_ROTATE_SECS) },
+        { key = "random", title = "Aleat\xc3\xb3ria" },
+        { key = "off",    title = "Sem cena" },
+    }
+    for _, m in ipairs(modes) do
+        items[#items + 1] = {
+            title = m.title, image = menuIcon(m.key), checked = mode == m.key,
+            fn = function()
+                hs.settings.set("voxtap.sceneMode", m.key)
+                if m.key == "rotate" then previewScene(sceneId()) end
+            end,
+        }
+    end
+    items[#items + 1] = { title = "-" }
+    items[#items + 1] = {
+        title = "Pr\xc3\xa9-visualizar", image = menuIcon("preview"),
+        disabled = mode == "off",
+        fn = function() previewScene(sceneId()) end,
+    }
+    return items
+end
+
+sceneMenubar = hs.menubar.new()   -- global para o Hammerspoon não o recolher
+if sceneMenubar then
+    sceneMenubar:setIcon(drawIcon({
+        { type = "rectangle", frame = { x = 2, y = 6.5, w = 1.8, h = 5 }, roundedRectRadii = { xRadius = 0.9, yRadius = 0.9 }, action = "fill" },
+        { type = "rectangle", frame = { x = 5.5, y = 4, w = 1.8, h = 10 }, roundedRectRadii = { xRadius = 0.9, yRadius = 0.9 }, action = "fill" },
+        { type = "rectangle", frame = { x = 9, y = 2, w = 1.8, h = 14 }, roundedRectRadii = { xRadius = 0.9, yRadius = 0.9 }, action = "fill" },
+        { type = "rectangle", frame = { x = 12.5, y = 5, w = 1.8, h = 8 }, roundedRectRadii = { xRadius = 0.9, yRadius = 0.9 }, action = "fill" },
+        { type = "rectangle", frame = { x = 16, y = 7, w = 1.8, h = 4 }, roundedRectRadii = { xRadius = 0.9, yRadius = 0.9 }, action = "fill" },
+    }, 18))
+    sceneMenubar:setTooltip("VoxTap: cena do ditado")
+    sceneMenubar:setMenu(sceneMenu)
+end
 
 -- Pré-aquecer o webview no startup para evitar atraso na primeira gravação.
 -- Cria-se directamente OFF_SCREEN para nunca aparecer no top-center antes de :hide(),

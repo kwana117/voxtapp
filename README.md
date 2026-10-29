@@ -172,6 +172,10 @@ Optional: `VOXT_STREAM_DELAY` (`low`/`medium`/`high`, default `medium`: higher i
 
 If the API fails (no network, bad key), the whole recording is kept and transcribed by whisper.cpp when you stop, as in block mode. Each session appends its length in seconds to `~/.voxtapp-usage.log`.
 
+#### Scene behind the live text
+
+In real-time mode a scene is drawn behind the text, driven by your voice: loudness plus the balance of lows, mids and highs, sent 20 times a second by `stream-dictate.mjs`. The small bars follow your real voice too. Pick it from the VoxTapp icon in the menu bar: one of six scenes (Fita líquida, Partículas, Anel de ondas, Aurora, Bolhas de luz, Constelação), alternate per dictation, alternate during a dictation (every 12 s), random, or none. Choosing a scene shows a 6-second preview. The scenes live in `voxtap-scenes.js` (copied to `~/.hammerspoon/` by `install.sh`).
+
 ## Troubleshooting
 
 | Symptom | Fix |

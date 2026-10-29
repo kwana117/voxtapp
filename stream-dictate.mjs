@@ -8,6 +8,8 @@
 // stdout: uma linha JSON por evento
 //   {"t":"ready"}                       ligação aberta, a transcrever
 //   {"t":"live","text":"..."}           texto completo até agora (final + parcial)
+//   {"t":"lvl","v":[rms,g,m,a]}         20 vezes por segundo: volume e energia dos
+//                                       graves, médios e agudos (cena da pílula)
 //   {"t":"error","msg":"..."}           a API falhou; o áudio continua a ser gravado
 //   {"t":"final","text":"...","failed":bool}   no fim; failed=true → usar fallback
 //
@@ -32,6 +34,7 @@ const MIN_TURN_SECS = 20;
 const MAX_TURN_SECS = 120;
 const PAUSE_MS = 400;
 const SILENCE_RMS = 0.02;               // mesmo limiar do monitor de microfone
+const LEVEL_BYTES = SAMPLE_RATE * 2 / 20; // 50 ms por medição de volume
 
 function loadEnvFile() {
     const env = {};
@@ -177,9 +180,34 @@ function rms(buf) {
     return n ? Math.sqrt(sum / n) : 0;
 }
 
+// Volume e timbre para a cena da pílula: dois filtros simples separam graves
+// (< 320 Hz), médios e agudos (> 2 kHz); o estado dos filtros passa de bloco para bloco.
+const LP_LOW = 1 - Math.exp(-2 * Math.PI * 320 / SAMPLE_RATE);
+const LP_HIGH = 1 - Math.exp(-2 * Math.PI * 2000 / SAMPLE_RATE);
+let lpLow = 0, lpHigh = 0, levelCarry = Buffer.alloc(0);
+
+function emitLevels(data) {
+    levelCarry = Buffer.concat([levelCarry, data]);
+    while (levelCarry.length >= LEVEL_BYTES) {
+        const n = LEVEL_BYTES >> 1;
+        let all = 0, lo = 0, mi = 0, hi = 0;
+        for (let i = 0; i < n; i++) {
+            const x = levelCarry.readInt16LE(i * 2) / 32768;
+            lpLow += LP_LOW * (x - lpLow);
+            lpHigh += LP_HIGH * (x - lpHigh);
+            all += x * x; lo += lpLow * lpLow;
+            mi += (lpHigh - lpLow) ** 2; hi += (x - lpHigh) ** 2;
+        }
+        levelCarry = levelCarry.subarray(LEVEL_BYTES);
+        const r = (v) => Math.round(Math.sqrt(v / n) * 10000) / 10000;
+        emit({ t: "lvl", v: [r(all), r(lo), r(mi), r(hi)] });
+    }
+}
+
 // Junta o PCM em blocos de 100 ms, envia, e corta blocos longos numa pausa.
 function onPcm(data) {
     appendFileSync(rawPath, data, { mode: 0o600 });
+    emitLevels(data);
     carry = Buffer.concat([carry, data]);
     while (carry.length >= CHUNK_BYTES) {
         const chunk = carry.subarray(0, CHUNK_BYTES);

@@ -13,6 +13,7 @@ echo "[2/7] A instalar config do Hammerspoon e sons..."
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 mkdir -p "$HOME/.hammerspoon/sounds"
 cp "$REPO_DIR/hammerspoon-init.lua" "$HOME/.hammerspoon/init.lua"
+cp "$REPO_DIR/voxtap-scenes.js" "$HOME/.hammerspoon/voxtap-scenes.js"
 cp "$REPO_DIR/sounds/"*.mp3 "$HOME/.hammerspoon/sounds/"
 echo "✓ Config e sons copiados para ~/.hammerspoon/"
 
