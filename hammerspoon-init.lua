@@ -216,6 +216,10 @@ local VIEW_H = PILL_H + PAD * 2
 local PILL_Y = 8
 local EXP_PILL_W = 560   -- pílula larga do modo em tempo real
 local EXP_VIEW_W = EXP_PILL_W + PAD * 2
+-- Altura fixa desde o primeiro instante: linha de estado + 4 linhas de texto.
+-- Assim a cena tem sempre o mesmo palco e a pílula não salta enquanto falas.
+local EXP_PILL_H = 136
+local EXP_VIEW_H = EXP_PILL_H + PAD * 2
 
 local function getViewFrame(w, h)
     w = w or VIEW_W
@@ -378,15 +382,15 @@ local function shellHTML()
             /* === Pílula larga com texto ao vivo (modo em tempo real) === */
             .pill.expanded {
                 width: %dpx;
-                height: auto;
-                min-height: %dpx;
+                height: %dpx;
                 flex-wrap: wrap;
+                align-content: flex-start;
                 padding: 12px 16px;
             }
             .live {
                 flex-basis: 100%%;
                 margin-top: 8px;
-                max-height: 80px;          /* 4 linhas; o início sai por cima */
+                height: 80px;              /* 4 linhas; o início sai por cima */
                 overflow: hidden;
                 display: flex;
                 flex-direction: column;
@@ -399,6 +403,7 @@ local function shellHTML()
                 white-space: normal;
             }
             .live.hidden { display: none; }
+            .pill.expanded .live.hidden { display: flex; }   /* vazio mas a ocupar o lugar */
         </style></head>
         <body>
             <div class="wrapper">
@@ -414,7 +419,7 @@ local function shellHTML()
             <!--SCENES-->
         </body>
         </html>
-    ]], PAD, PILL_W, PILL_H, EXP_PILL_W, PILL_H)
+    ]], PAD, PILL_W, PILL_H, EXP_PILL_W, EXP_PILL_H)
     -- As cenas vêm de um ficheiro à parte (o mesmo da página de demonstração);
     -- junta-se fora do string.format para os % do JavaScript não contarem.
     local f = io.open(scenesScript, "r")
@@ -449,27 +454,9 @@ local function ensurePill(onReady)
     end)
 end
 
--- Ajusta a altura da janela à pílula larga (cresce para baixo, topo fixo).
-local function fitPillToContent()
-    if not pillView then return end
-    -- 0 se a pílula já voltou ao tamanho normal (a resposta chega assíncrona).
-    pillView:evaluateJavaScript(
-        "(function(){var p=document.getElementById('pill');return p.className.indexOf('expanded')<0?0:p.offsetHeight;})()",
-        function(h)
-        h = tonumber(h)
-        if h and h > 0 and pillView then pillView:frame(getViewFrame(EXP_VIEW_W, h + PAD * 2)) end
-    end)
-end
-
 local function updatePill(opts)
-    -- Se a pílula já estava larga, mantém a altura (evita cortar o texto até
-    -- o fitPillToContent responder).
-    local prev = pillView and pillView:frame()
     ensurePill()
-    if opts.expanded then
-        local h = (prev and prev.w == EXP_VIEW_W) and prev.h or (VIEW_H + 40)
-        pillView:frame(getViewFrame(EXP_VIEW_W, h))
-    end
+    if opts.expanded then pillView:frame(getViewFrame(EXP_VIEW_W, EXP_VIEW_H)) end
     local safeText  = (opts.text  or ""):gsub("\\", "\\\\"):gsub("'", "\\'")
     local safeBadge = (opts.badge or ""):gsub("\\", "\\\\"):gsub("'", "\\'")
     local js = string.format([[
@@ -514,7 +501,6 @@ local function updatePill(opts)
         opts.showWave and "true" or "false"
     )
     pillView:evaluateJavaScript(js)
-    if opts.expanded then fitPillToContent() end
 end
 
 -- Texto ao vivo na pílula larga. Só o fim do texto (o resto sai por cima).
@@ -532,7 +518,6 @@ local function renderLiveText()
             document.getElementById('live').className = t ? 'live' : 'live hidden';
         })();
     ]], hs.json.encode({ t = text })))
-    fitPillToContent()
 end
 
 local function setLiveText(text)
@@ -1708,6 +1693,11 @@ if sceneMenubar then
     sceneMenubar:setTooltip("VoxTap: cena do ditado")
     sceneMenubar:setMenu(sceneMenu)
 end
+
+-- Pré-visualizar sem o menu: open -g "hammerspoon://voxtap-cena?id=aurora"
+hs.urlevent.bind("voxtap-cena", function(_, params)
+    previewScene(SCENES[sceneIndex(params.id or sceneId())].id)
+end)
 
 -- Pré-aquecer o webview no startup para evitar atraso na primeira gravação.
 -- Cria-se directamente OFF_SCREEN para nunca aparecer no top-center antes de :hide(),

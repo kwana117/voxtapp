@@ -31,10 +31,12 @@
     }
 
     // RMS 0..1 e RMS de cada banda; ganho automático para a voz encher a cena.
+    // O pico esquece-se em ~2 s (um "p" forte não abafa o resto da frase) e a
+    // curva levanta a voz baixa, para a cena mexer mesmo a falar devagar.
     function feed(rms, lo, mi, hi) {
         if (sim.timer) return;
-        A.peak = Math.max(rms, A.peak * .995, .03);
-        target((rms - .006) / A.peak, [lo, mi * 1.3, hi * 3.5]);
+        A.peak = Math.max(rms, A.peak * .985, .02);
+        target(Math.pow(clamp((rms - .004) / A.peak), .6), [lo, mi * 1.3, hi * 3.5]);
     }
 
     function mix(weights) {
