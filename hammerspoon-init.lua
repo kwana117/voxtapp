@@ -262,6 +262,13 @@ local SCENE_GLUE = [[<script>
     window.voxScene = function(on, id, rot) { on ? inst().show(id, rot) : inst().hide(); };
     window.voxLvl = function(v) { VoxScenes.feed(v[0], v[1], v[2], v[3]); };
     window.voxPreview = function(on) { VoxScenes.simulate(on); };
+    window.voxFont = function(family, css) {
+        if (css && !document.querySelector('link[href="' + css + '"]')) {
+            var l = document.createElement('link'); l.rel = 'stylesheet'; l.href = css;
+            document.head.appendChild(l);
+        }
+        document.getElementById('pill').style.fontFamily = family + ', -apple-system, BlinkMacSystemFont, sans-serif';
+    };
     VoxScenes.onLevel = function(l) {
         var w = document.getElementById('wave');
         if (!w || w.className !== 'wave') return;
@@ -454,9 +461,37 @@ local function ensurePill(onReady)
     end)
 end
 
+-- Letra da pílula, escolhida no menu. Vem da internet na primeira vez que se
+-- usa (Google Fonts, Fontshare); sem rede fica a letra do sistema.
+-- letra-verificada: Plus Jakarta Sans e Onest são escolhas tuas (memória user_letras_favoritas).
+local GF = "https://fonts.googleapis.com/css2?display=swap&family="
+local FONTS = {
+    { id = "system",   name = "Sistema (SF Pro)",           family = "-apple-system" },
+    { id = "jakarta",  name = "Plus Jakarta Sans",          family = "'Plus Jakarta Sans'",          css = GF .. "Plus+Jakarta+Sans:wght@400;500" },
+    { id = "geologica", name = "Geologica",                 family = "'Geologica'",                  css = GF .. "Geologica:wght@400;500" },
+    { id = "onest",    name = "Onest",                      family = "'Onest'",                      css = GF .. "Onest:wght@400;500" },
+    { id = "public",   name = "Public Sans",                family = "'Public Sans'",                css = GF .. "Public+Sans:wght@400;500" },
+    { id = "albert",   name = "Albert Sans",                family = "'Albert Sans'",                css = GF .. "Albert+Sans:wght@400;500" },
+    { id = "atkinson", name = "Atkinson Hyperlegible Next", family = "'Atkinson Hyperlegible Next'", css = GF .. "Atkinson+Hyperlegible+Next:wght@400;500" },
+    { id = "tasa",     name = "TASA Orbiter",               family = "'TASA Orbiter'",               css = GF .. "TASA+Orbiter:wght@400;500" },
+    { id = "chillax",  name = "Chillax",                    family = "'Chillax'",                    css = "https://api.fontshare.com/v2/css?f[]=chillax@400,500&display=swap" },
+    { id = "fragment", name = "Fragment Mono",              family = "'Fragment Mono'",              css = GF .. "Fragment+Mono" },
+}
+
+local DEFAULT_FONT = "public"
+
+local function currentFont()
+    local id = hs.settings.get("voxtap.font") or DEFAULT_FONT
+    for _, f in ipairs(FONTS) do if f.id == id then return f end end
+    return FONTS[1]
+end
+
 local function updatePill(opts)
     ensurePill()
     if opts.expanded then pillView:frame(getViewFrame(EXP_VIEW_W, EXP_VIEW_H)) end
+    local font = currentFont()
+    pillView:evaluateJavaScript(string.format("window.voxFont&&voxFont(%s,%s)",
+        hs.json.encode({ font.family }):sub(2, -2), font.css and hs.json.encode({ font.css }):sub(2, -2) or "null"))
     local safeText  = (opts.text  or ""):gsub("\\", "\\\\"):gsub("'", "\\'")
     local safeBadge = (opts.badge or ""):gsub("\\", "\\\\"):gsub("'", "\\'")
     local js = string.format([[
@@ -1624,6 +1659,16 @@ local SCENE_ICONS = {
     }) end,
 }
 
+SCENE_ICONS.font = function()
+    local c = hs.canvas.new({ x = 0, y = 0, w = 16, h = 16 })
+    c:appendElements({ type = "text", frame = { x = 0, y = 0, w = 16, h = 16 },
+        text = hs.styledtext.new("Aa", { font = { name = ".AppleSystemUIFontBold", size = 11 },
+            color = { white = 0, alpha = 1 }, paragraphStyle = { alignment = "center" } }) })
+    local img = c:imageFromCanvas()
+    c:delete()
+    return img and img:template(true)
+end
+
 local MODE_ICONS = {
     cycle   = "NSRefreshTemplate",
     rotate  = "NSSlideshowTemplate",
@@ -1673,9 +1718,17 @@ local function sceneMenu()
         }
     end
     items[#items + 1] = { title = "-" }
+    local fonts, chosen = {}, currentFont().id
+    for _, f in ipairs(FONTS) do
+        local id = f.id
+        fonts[#fonts + 1] = {
+            title = f.name, image = menuIcon("font"), checked = id == chosen,
+            fn = function() hs.settings.set("voxtap.font", id); previewScene(sceneId()) end,
+        }
+    end
+    items[#items + 1] = { title = "Letra do texto", image = menuIcon("font"), menu = fonts }
     items[#items + 1] = {
         title = "Pr\xc3\xa9-visualizar", image = menuIcon("preview"),
-        disabled = mode == "off",
         fn = function() previewScene(sceneId()) end,
     }
     return items
